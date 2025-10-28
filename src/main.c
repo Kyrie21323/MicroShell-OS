@@ -46,10 +46,15 @@ int main() {
         //execute command (pipeline or single)
         if(strchr(cmd, '|') != NULL){
             //command contains pipe symbol - execute as pipeline
-            execute_pipeline(cmd);
+            char* output = execute_pipeline(cmd);
+            printf("%s", output);
+            free(output);
         }else if(parse_command(cmd, args, &inputFile, &outputFile, &errorFile, 0) == 0){
             //single command - parse and execute if parsing succeeded
-            execute_command(args, inputFile, outputFile, errorFile);
+            char* output = execute_command(args, inputFile, outputFile, errorFile);
+            printf("%s", output);
+            free(output);
+
             //free argv strings created by qtokenize/globbing
             for(int i=0; args[i]!=NULL; i++){
                 free(args[i]);
