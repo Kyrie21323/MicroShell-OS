@@ -1,6 +1,7 @@
 #include "exec.h"
 #include "parse.h"
 #include "redir.h"
+#include "util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,15 +9,11 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 
-//maximum length for command input buffer
 #define MAX_CMD_LENGTH 1024 
-//maximum number of arguments a command can have
 #define MAX_ARGS 64         
-//maximum number of pipes in a pipeline
 #define MAX_PIPES 10
+#define OUTPUT_BUFFER_SIZE 4096
 
-//structure definition for pipeline stages
-//each stage in a pipeline is a separate command with its own arguments and redirections
 typedef struct {
     char *args[MAX_ARGS];
     char *inputFile;
@@ -24,200 +21,223 @@ typedef struct {
     char *errorFile;
 } Stage;
 
-/*utility function to skip leading whitespace characters.
-This function advances the pointer past any spaces, tabs, or newlines at the beginning of a string, returning a pointer to the first non-whitespace character
-*/
 static char* skip_whitespace(char *str){
-    //loop through string while current character is whitespace
     while(*str == ' ' || *str == '\t' || *str == '\n'){
         str++;
     }
     return str;
 }
 
-/*Execute a single command with optional file redirections
-This function creates a child process to run the command and handles redirections. The parent process waits for the child to complete before returning
-*/
-void execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile) {
-    //create a child process using fork()
-    pid_t pid = fork();
+/**
+ * @brief Reads all data from a file descriptor into a dynamically allocated string.
+ * * @param fd The file descriptor to read from.
+ * @return A dynamically allocated string containing the data. Caller must free it.
+ */
+static char* read_output_from_fd(int fd) {
+    size_t capacity = OUTPUT_BUFFER_SIZE;
+    size_t total_read = 0;
+    char *buffer = malloc(capacity);
+    if (!buffer) {
+        perror("malloc");
+        return NULL;
+    }
 
-    if(pid < 0){
-        perror("fork failed");
-        return;
+    ssize_t bytes_read;
+    while ((bytes_read = read(fd, buffer + total_read, capacity - total_read - 1)) > 0) {
+        total_read += bytes_read;
+        if (total_read >= capacity - 1) {
+            capacity *= 2;
+            char *new_buffer = realloc(buffer, capacity);
+            if (!new_buffer) {
+                perror("realloc");
+                free(buffer);
+                return NULL;
+            }
+            buffer = new_buffer;
+        }
     }
-    
-    if(pid == 0){
-        //child process : execute the command with redirections, set up input redirection if specified, redirect stdin to read from inputFile
-        if(inputFile && setup_redirection(inputFile, O_RDONLY, STDIN_FILENO) < 0){
-            exit(EXIT_FAILURE);
-        }
-        
-        //set up output redirection if specified
-        //redirect stdout to write to outputFile
-        if(outputFile && setup_redirection(outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0){
-            exit(EXIT_FAILURE);
-        }
-        
-        //set up error redirection if specified
-        //redirect stderr to write to errorFile
-        if(errorFile && setup_redirection(errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0){
-            exit(EXIT_FAILURE);
-        }
-        
-        //execute the command using execvp, it searches PATH environment variable for the executable
-        if(execvp(args[0], args) < 0){
-            printf("Command not found.\n");
-            exit(EXIT_FAILURE);
-        }
-    }else{
-        //parent process : wait for child to complete, wait() blocks until child process terminates
-        //this ensures the shell waits for command completion before showing next prompt
-        wait(NULL);
-    }
+    buffer[total_read] = '\0';
+    return buffer;
 }
 
-/*main pipeline execution function that handles commands with pipes (|)
-this function creates multiple processes and connects their input/output streams using pipe() and dup2() system calls to simulate shell pipeline behavior
-*/
-void execute_pipeline(char *cmd){
-    //validate that the pipeline syntax is correct
-    if(validate_pipeline(cmd) != 0){
-        return;
+
+/*
+ * Executes a single command, capturing its stdout and stderr.
+ * This function forks a child process to run the command. The parent process
+ * sets up a pipe to capture the child's output and returns it as a string.
+ */
+char* execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile) {
+    int output_pipe[2];
+    if (pipe(output_pipe) < 0) {
+        perror("pipe failed");
+        return xstrdup("");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork failed");
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return xstrdup("");
     }
     
-    //array to store information about each stage in the pipeline
+    if (pid == 0) { // Child process
+        close(output_pipe[0]); // Close unused read end
+
+        // Redirect stdout and stderr to the pipe, unless file redirection is specified.
+        if (!outputFile) {
+            dup2(output_pipe[1], STDOUT_FILENO);
+        }
+        if (!errorFile) {
+            dup2(output_pipe[1], STDERR_FILENO);
+        }
+        
+        // Handle file redirections which take precedence
+        if (inputFile && setup_redirection(inputFile, O_RDONLY, STDIN_FILENO) < 0) {
+            exit(EXIT_FAILURE);
+        }
+        if (outputFile && setup_redirection(outputFile, O_WRONLY | O_CREAT | O_TRUNC, STDOUT_FILENO) < 0) {
+            exit(EXIT_FAILURE);
+        }
+        if (errorFile && setup_redirection(errorFile, O_WRONLY | O_CREAT | O_TRUNC, STDERR_FILENO) < 0) {
+            exit(EXIT_FAILURE);
+        }
+        
+        close(output_pipe[1]); // Close the write end after dup2
+        
+        if (execvp(args[0], args) < 0) {
+            fprintf(stderr, "Command not found: %s\n", args[0]);
+            exit(EXIT_FAILURE);
+        }
+    } else { // Parent process
+        close(output_pipe[1]); // Close unused write end
+        
+        char *output = read_output_from_fd(output_pipe[0]);
+        
+        close(output_pipe[0]);
+        wait(NULL); // Wait for child to complete
+        
+        return output;
+    }
+    return xstrdup(""); // Should not be reached
+}
+
+/*
+ * Executes a pipeline of commands, capturing the final stdout and stderr from all commands.
+ * It creates a series of pipes to connect the commands and an additional pipe
+ * to capture all output and errors destined for the client.
+ */
+char* execute_pipeline(char *cmd) {
+    if (validate_pipeline(cmd) != 0) {
+        return xstrdup("Invalid pipeline syntax.\n");
+    }
+    
     Stage stages[MAX_PIPES];
-    int numStages = 0;                  //counter for number of stages found
-    int hasErrors = 0;                  //flag to track if any stage had parsing errors
+    int numStages = 0;
     
-    //split the command by pipe characters using strtok_r
-    char *saveptr;                                          //save pointer for strtok_r
-    char *stage_cmd = strtok_r(cmd, "|", &saveptr);         //get first stage
+    char *saveptr;
+    char *stage_cmd = strtok_r(cmd, "|", &saveptr);
     
-    //parse each stage of the pipeline
-    while(stage_cmd != NULL && numStages < MAX_PIPES){
+    while (stage_cmd != NULL && numStages < MAX_PIPES) {
         stage_cmd = skip_whitespace(stage_cmd);
-        
-        //local variables to hold parsed information for this stage
-        char *args[MAX_ARGS];                   //command arguments array
-        char *inputFile = NULL;                  //input redirection file
-        char *outputFile = NULL;                //output redirection file
-        char *errorFile = NULL;                 //error redirection file
-        
-        parse_command(stage_cmd, args, &inputFile, &outputFile, &errorFile, 1);
-        
-        //check if parsing failed (args[0] is NULL indicates parsing error)
-        if(args[0] == NULL){
-            hasErrors = 1;                  //set error flag
-            numStages++;
-            stage_cmd = strtok_r(NULL, "|", &saveptr);
-            continue;
+        if (parse_command(stage_cmd, stages[numStages].args, &stages[numStages].inputFile, &stages[numStages].outputFile, &stages[numStages].errorFile, 1) != 0) {
+             // Free any allocated args from previous successful parses
+            for (int i = 0; i < numStages; i++) {
+                for (int j = 0; stages[i].args[j] != NULL; j++) free(stages[i].args[j]);
+                if(stages[i].inputFile) free(stages[i].inputFile);
+                if(stages[i].outputFile) free(stages[i].outputFile);
+                if(stages[i].errorFile) free(stages[i].errorFile);
+            }
+            return xstrdup("Command parsing failed in pipeline.\n");
         }
-        
-        //copy to stage structure
-        int k = 0;
-        for(int i = 0; args[i] != NULL; i++){
-            stages[numStages].args[k++] = args[i];
-        }
-        stages[numStages].args[k] = NULL;               //null-terminate immediately after last arg
-        
-        //store redirection information for this stage
-        stages[numStages].inputFile = inputFile;
-        stages[numStages].outputFile = outputFile;
-        stages[numStages].errorFile = errorFile;
-        
         numStages++;
         stage_cmd = strtok_r(NULL, "|", &saveptr);
     }
     
-    //check if we have at least one valid stage to execute
-    if(numStages == 0){
-        return;
+    if (numStages == 0) return xstrdup("");
+
+    int capture_pipe[2]; // Pipe to capture final output and all errors
+    if (pipe(capture_pipe) < 0) {
+        perror("capture pipe failed");
+        return xstrdup("");
     }
-    
-    //don't execute pipeline if there were parsing errors
-    if(hasErrors){
-        return;
-    }
-    
-    //create pipes
-    int pipes[MAX_PIPES][2];
-    for(int i = 0; i < numStages - 1; i++){
-        if(pipe(pipes[i]) < 0){
+
+    int pipes[numStages - 1][2];
+    for (int i = 0; i < numStages - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
             perror("pipe failed");
-            return;
+            return xstrdup("");
         }
     }
     
-    //create a child process for each stage
-    pid_t pids[MAX_PIPES];
-    for(int i = 0; i < numStages; i++){
+    pid_t pids[numStages];
+    for (int i = 0; i < numStages; i++) {
         pids[i] = fork();
-        
-        if(pids[i] < 0){
+        if (pids[i] < 0) {
             perror("fork failed");
-            return;
-        }else if(pids[i] == 0){
-            /*child process : execute this stage of the pipeline
-            handle explicit file redirections first (they override pipe connections)
-            */
-            if(stages[i].inputFile && setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0){
-                exit(EXIT_FAILURE);
+            return xstrdup("");
+        } else if (pids[i] == 0) { // Child process for stage i
+            close(capture_pipe[0]); // Close read end of capture pipe
+
+            // Redirect stderr to capture pipe unless a file is specified
+            if (!stages[i].errorFile) {
+                dup2(capture_pipe[1], STDERR_FILENO);
             }
-            if(stages[i].outputFile && setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0){
-                exit(EXIT_FAILURE);
-            }
-            if(stages[i].errorFile && setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0){
-                exit(EXIT_FAILURE);
+
+            // Connect input from previous stage, unless a file is specified
+            if (i > 0 && !stages[i].inputFile) {
+                dup2(pipes[i - 1][0], STDIN_FILENO);
             }
             
-            //connect input from previous stage (only if no explicit input redirection)
-            if(i > 0 && stages[i].inputFile == NULL){
-                dup2(pipes[i-1][0], STDIN_FILENO);
-            }
-            //connect output to next stage (only if no explicit output redirection)
-            if(i < numStages - 1 && stages[i].outputFile == NULL){
+            // Connect output to next stage or capture pipe, unless a file is specified
+            if (i < numStages - 1 && !stages[i].outputFile) {
                 dup2(pipes[i][1], STDOUT_FILENO);
+            } else if (i == numStages - 1 && !stages[i].outputFile) {
+                // Last command's output goes to capture pipe
+                dup2(capture_pipe[1], STDOUT_FILENO);
             }
+
+            // Handle file redirections, which override pipes
+            if(stages[i].inputFile && setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0) exit(EXIT_FAILURE);
+            if(stages[i].outputFile && setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) exit(EXIT_FAILURE);
+            if(stages[i].errorFile && setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0) exit(EXIT_FAILURE);
             
-            //close pipe file descriptors that are not being used by this stage
-            for(int j = 0; j < numStages - 1; j++){
-                //close read end if this stage is not reading from this pipe
-                if(i == 0 || j != i-1){
-                    close(pipes[j][0]);
-                }
-                //close write end if this stage is not writing to this pipe
-                if(i == numStages-1 || j != i){
-                    close(pipes[j][1]);
-                }
+            // Close all pipe fds in the child
+            for (int j = 0; j < numStages - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
             }
+            close(capture_pipe[1]);
             
-            //execute the command
-            if(execvp(stages[i].args[0], stages[i].args) < 0){
-                //if we reach here, execvp failed, and an error message is printed to stderr (not stdout) to avoid interfering with pipeline
-                fprintf(stderr, "Command not found in pipe sequence.\n");
+            if (execvp(stages[i].args[0], stages[i].args) < 0) {
+                fprintf(stderr, "Command not found: %s\n", stages[i].args[0]);
                 exit(EXIT_FAILURE);
             }
         }
     }
     
-    /*parent process : close all pipes and wait for children
-    close all pipe file descriptors in parent
-    */
-    for(int i = 0; i < numStages - 1; i++){
+    // Parent process
+    close(capture_pipe[1]); // Close write end of capture pipe
+    for (int i = 0; i < numStages - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
     
-    //wait for the last process
-    int status;
-    waitpid(pids[numStages-1], &status, 0);
-    
-    //wait for all other children to avoid zombie processes
-    for(int i = 0; i < numStages; i++){
-        if(i != numStages-1){                       //don't wait twice for last process
-            waitpid(pids[i], &status, 0);
-        }
+    // Wait for all children to finish
+    for (int i = 0; i < numStages; i++) {
+        waitpid(pids[i], NULL, 0);
     }
+
+    char* output = read_output_from_fd(capture_pipe[0]);
+    close(capture_pipe[0]);
+
+    // Free memory
+    for (int i = 0; i < numStages; i++) {
+        for (int j = 0; stages[i].args[j] != NULL; j++) free(stages[i].args[j]);
+        if(stages[i].inputFile) free(stages[i].inputFile);
+        if(stages[i].outputFile) free(stages[i].outputFile);
+        if(stages[i].errorFile) free(stages[i].errorFile);
+    }
+
+    return output;
 }
