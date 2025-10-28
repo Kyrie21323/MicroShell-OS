@@ -1,22 +1,20 @@
 #include "net.h"
 #include "parse.h"
 #include "exec.h"
+#include "util.h" // <--- ADDED THIS LINE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 
-//maximum length for command input buffer
 #define MAX_CMD_LENGTH 1024 
-//maximum number of arguments a command can have
 #define MAX_ARGS 64         
 
-//global variables for signal handling
 static int server_fd = -1;
 static int client_fd = -1;
 
-//signal handler for graceful shutdown, closes sockets and exits cleanly
 void signal_handler(int sig){
+    (void)sig; // <--- ADDED THIS LINE to fix the unused parameter warning
     printf("\n[INFO] Shutting down server...\n");
     if(client_fd >= 0){
         close_socket(client_fd);
@@ -27,14 +25,10 @@ void signal_handler(int sig){
     exit(0);
 }
 
-//server main function, sets up socket, accepts client connections, and processes commands
 int main(int argc, char *argv[]) {
     int port;
     char cmd_buffer[MAX_CMD_LENGTH];
-    char *args[MAX_ARGS];
-    char *inputFile, *outputFile, *errorFile;
 
-    //check command line arguments
     if(argc != 2){
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         exit(1);
@@ -46,93 +40,101 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    //set up signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    //create server socket
     server_fd = create_server_socket(port);
     if(server_fd < 0){
         fprintf(stderr, "Error: Failed to create server socket\n");
         exit(1);
     }
 
-    printf("[INFO] Server started on port %d\n", port);
+    printf("[INFO] Server started on port %d, waiting for client connections...\n", port);
 
-    //main server loop
     while (1){
-        //accept client connection
         client_fd = accept_client_connection(server_fd);
         if(client_fd < 0){
             fprintf(stderr, "Error: Failed to accept client connection\n");
             continue;
         }
 
-        printf("[INFO] Client session started\n");
+        printf("[INFO] Client connected.\n");
 
-        //process commands from client
         while(1){
-            //receive command from client
             int bytes_received = receive_line(client_fd, cmd_buffer, sizeof(cmd_buffer));
             
             if(bytes_received <= 0){
                 if(bytes_received == 0){
                     printf("[INFO] Client disconnected\n");
-                }else{
+                } else {
                     perror("Error receiving command");
                 }
                 break;
             }
 
-            //log the received command
             printf("[RECEIVED] Received command: \"%s\" from client.\n", cmd_buffer);
 
-            //handle exit command
             if(strcmp(cmd_buffer, "exit") == 0){
                 printf("[INFO] Client requested exit\n");
                 break;
             }
-
-            //skip empty commands
             if(strlen(cmd_buffer) == 0){
                 continue;
             }
+            
+            printf("[EXECUTING] Executing command: \"%s\"\n", cmd_buffer);
 
-            //execute command using existing shell functions
-            if(strchr(cmd_buffer, '|') != NULL){
-                //pipeline command
-                printf("[INFO] Executing pipeline command\n");
-                execute_pipeline(cmd_buffer);
-            }else if(parse_command(cmd_buffer, args, &inputFile, &outputFile, &errorFile, 0) == 0){
-                //single command
-                printf("[INFO] Executing single command\n");
-                execute_command(args, inputFile, outputFile, errorFile);
-                
-                //free memory allocated by parse_command
-                for(int i = 0; args[i] != NULL; i++){
-                    free(args[i]);
+            char *output_str = NULL;
+            // Use a copy for parsing/execution because strtok_r in execute_pipeline modifies it
+            char cmd_copy[MAX_CMD_LENGTH];
+            strncpy(cmd_copy, cmd_buffer, MAX_CMD_LENGTH);
+
+            if(strchr(cmd_copy, '|') != NULL){
+                output_str = execute_pipeline(cmd_copy);
+            } else {
+                char *args[MAX_ARGS];
+                char *inputFile, *outputFile, *errorFile;
+                if(parse_command(cmd_copy, args, &inputFile, &outputFile, &errorFile, 0) == 0){
+                    output_str = execute_command(args, inputFile, outputFile, errorFile);
+                    
+                    for(int i = 0; args[i] != NULL; i++) free(args[i]);
+                    if(inputFile) free(inputFile);
+                    if(outputFile) free(outputFile);
+                    if(errorFile) free(errorFile);
+                } else {
+                    output_str = xstrdup("Error: Command parsing failed.\n");
                 }
-                if(inputFile){
-                    free(inputFile);
+            }
+            
+            // Log output before sending to client, as per project requirements
+            if (output_str && strlen(output_str) > 0) {
+                 // Check if the last character is a newline, if not, the formatting could be messy
+                int len = strlen(output_str);
+                if (output_str[len - 1] == '\n') {
+                    printf("[OUTPUT] Sending output to client:\n%s", output_str);
+                } else {
+                    printf("[OUTPUT] Sending output to client:\n%s\n", output_str);
                 }
-                if(outputFile){
-                    free(outputFile);
-                }
-                if(errorFile){
-                    free(errorFile);
-                }
-            }else{
-                printf("[INFO] Command parsing failed\n");
+            } else {
+                 printf("[OUTPUT] Sending empty output to client.\n");
+            }
+
+
+            // Send the result back to the client
+            if (send_line(client_fd, output_str ? output_str : "") < 0) {
+                perror("Error sending output to client");
+            }
+
+            if (output_str) {
+                free(output_str);
             }
         }
 
-        //close client connection
         close_socket(client_fd);
         client_fd = -1;
         printf("[INFO] Client session ended\n");
     }
 
-    //clean up
     close_socket(server_fd);
     return 0;
 }
