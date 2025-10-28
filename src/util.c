@@ -2,10 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <errno.h>
 #include <unistd.h>
 
-/* Portable strdup to avoid feature-macro surprises */
 char *xstrdup(const char *s){
     if(!s) return NULL;
     size_t n = strlen(s) + 1;
@@ -15,7 +13,6 @@ char *xstrdup(const char *s){
     return p;
 }
 
-//strip one pair of outer quotes from a string if present
 char *strip_outer_quotes(const char *str) {
     if(!str){
         return NULL;
@@ -25,8 +22,7 @@ char *strip_outer_quotes(const char *str) {
         return xstrdup(str);
     }
     
-    //check for single quotes
-    if(str[0] == '\'' && str[len-1] == '\''){
+    if((str[0] == '\'' && str[len-1] == '\'') || (str[0] == '"' && str[len-1] == '"')){
         char *result = malloc(len - 1);
         if(!result){
             perror("malloc");
@@ -37,18 +33,5 @@ char *strip_outer_quotes(const char *str) {
         return result;
     }
     
-    //check for double quotes
-    if(str[0] == '"' && str[len-1] == '"'){
-        char *result = malloc(len - 1);
-        if(!result){
-            perror("malloc");
-            _exit(127);
-        }
-        memcpy(result, str + 1, len - 2);
-        result[len - 2] = '\0';
-        return result;
-    }
-    
-    //no outer quotes, return copy
     return xstrdup(str);
 }
