@@ -25,16 +25,14 @@ int validate_pipeline(char *cmd){
     char *p = skip_whitespace(buf);
 
     if (*p == '|') {
-        printf("Invalid pipeline: starts with pipe.\n");
-        return -1;
+        return VALIDATE_ERR_STARTS_PIPE;
     }
 
     int saw_non_ws_since_pipe = 0;
     for (char *q = p; *q; ++q) {
         if (*q == '|') {
             if (!saw_non_ws_since_pipe) {
-                printf("Invalid pipeline: empty command between pipes.\n");
-                return -1;
+                return VALIDATE_ERR_EMPTY_CMD;
             }
             saw_non_ws_since_pipe = 0;
         } else if (*q != ' ' && *q != '\t' && *q != '\n') {
@@ -43,40 +41,50 @@ int validate_pipeline(char *cmd){
     }
 
     if (!saw_non_ws_since_pipe) {
-        printf("Invalid pipeline: ends with pipe.\n");
-        return -1;
+        return VALIDATE_ERR_ENDS_PIPE;
     }
 
-    return 0;
+    return VALIDATE_SUCCESS;
 }
 
 int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline){
+    (void)isPipeline; // isPipeline is now handled by the caller based on error code
     *inputFile = *outputFile = *errorFile = NULL;
 
     QTok *toks=NULL; int nt=0;
     if(qtokenize(cmd, &toks, &nt)!=0){
-        // No need to print, qtokenize doesn't exist
-        args[0]=NULL; return -1;
+        args[0]=NULL; return PARSE_ERR_SYNTAX;
     }
-    if(nt==0){ args[0]=NULL; free_qtokens(toks,nt); return -1; }
+    if(nt==0){ args[0]=NULL; free_qtokens(toks,nt); return PARSE_ERR_SYNTAX; }
 
     bool quoted[MAX_ARGS]; int ac=0;
     for(int i=0;i<nt;i++){
-        if(ac>=MAX_ARGS-1){ free_qtokens(toks,nt); args[0]=NULL; return -1; }
+        if(ac>=MAX_ARGS-1){ 
+            // Free tokens that were already transferred to args
+            for(int k=0; k<ac; k++) free(args[k]);
+            // Free remaining tokens that were not transferred
+            for(int k=i; k<nt; k++) free(toks[k].val);
+            free(toks);
+            args[0]=NULL; 
+            return PARSE_ERR_TOO_MANY_ARGS; 
+        }
         args[ac] = toks[i].val;
         quoted[ac] = toks[i].was_quoted;
         ac++;
     }
-    free(toks);
+    free(toks); // The container is freed, but the strings are now owned by 'args'
 
     for(int i=0;i<ac;i++){
         if(!quoted[i] && (strcmp(args[i],"<")==0 || strcmp(args[i],">")==0 || strcmp(args[i],"2>")==0)){
             if(i+1>=ac){ 
-                if(strcmp(args[i],"<")==0) printf("Input file not specified.\n");
-                else if(strcmp(args[i],">")==0) printf(isPipeline ? "Output file not specified after redirection.\n" : "Output file not specified.\n");
-                else printf("Error output file not specified.\n");
+                int err_code = PARSE_ERR_SYNTAX;
+                if(strcmp(args[i],"<")==0) err_code = PARSE_ERR_NO_INPUT_FILE;
+                else if(strcmp(args[i],">")==0) err_code = PARSE_ERR_NO_OUTPUT_FILE;
+                else err_code = PARSE_ERR_NO_ERROR_FILE;
+
                 for(int k=0;k<ac;k++) free(args[k]);
-                args[0]=NULL; return -1;
+                args[0]=NULL; 
+                return err_code;
             }
         }
     }
@@ -84,11 +92,17 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
     char *argv2[MAX_ARGS]; bool quoted2[MAX_ARGS]; int m=0;
     for(int i=0;i<ac;i++){
         if(!quoted[i] && strcmp(args[i],"<")==0){
-            *inputFile = strip_outer_quotes(args[i+1]); i++; continue;
+            *inputFile = strip_outer_quotes(args[i+1]); 
+            free(args[i]); free(args[i+1]);
+            i++; continue;
         }else if(!quoted[i] && strcmp(args[i],">")==0){
-            *outputFile = strip_outer_quotes(args[i+1]); i++; continue;
+            *outputFile = strip_outer_quotes(args[i+1]); 
+            free(args[i]); free(args[i+1]);
+            i++; continue;
         }else if(!quoted[i] && strcmp(args[i],"2>")==0){
-            *errorFile = strip_outer_quotes(args[i+1]); i++; continue;
+            *errorFile = strip_outer_quotes(args[i+1]);
+            free(args[i]); free(args[i+1]);
+            i++; continue;
         }else{
             argv2[m]=args[i]; quoted2[m]=quoted[i]; m++;
         }
@@ -99,7 +113,7 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
         if(*inputFile){ free(*inputFile); *inputFile=NULL; }
         if(*outputFile){ free(*outputFile); *outputFile=NULL; }
         if(*errorFile){ free(*errorFile); *errorFile=NULL; }
-        args[0]=NULL; return -1;
+        args[0]=NULL; return PARSE_ERR_EMPTY_CMD_REDIR;
     }
 
     apply_globbing(argv2, quoted2, &m);
@@ -107,5 +121,5 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
     for(int i=0;i<m;i++) args[i]=argv2[i];
     args[m]=NULL;
 
-    return 0;
+    return PARSE_SUCCESS;
 }
