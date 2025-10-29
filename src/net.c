@@ -42,13 +42,17 @@ int create_server_socket(int port){
 }
 
 //accepts a client connection on the server socket, blocks until a client connects, returns client socket file descriptor on success, -1 on failure
+//Returns -1 on error (including EINTR), caller should check errno
 int accept_client_connection(int server_fd){
     struct sockaddr_in address;
     int addrlen = sizeof(address);
     int client_fd;
 
     if((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0){
-        perror("accept failed");
+        // Don't print error for EINTR - it's handled by the caller
+        if(errno != EINTR){
+            perror("accept failed");
+        }
         return -1;
     }
     
@@ -109,6 +113,8 @@ int send_line(int socket_fd, const char *line){
 }
 
 //receives a line of text from the socket, reading the length prefix first.
+//Returns the number of bytes received, or 0/negative on error/EOF.
+//Handles empty messages (line_len == 0) correctly.
 int receive_line(int socket_fd, char *buffer, int buffer_size){
     int32_t net_len;
     
@@ -133,15 +139,17 @@ int receive_line(int socket_fd, char *buffer, int buffer_size){
         return -1;
     }
 
-    // Receive the actual line data
-    ssize_t data_bytes = recv(socket_fd, buffer, line_len, MSG_WAITALL);
-    if(data_bytes != line_len){
-        // This indicates a problem, as MSG_WAITALL should have returned the full amount
-        return -1;
+    // Receive the actual line data (if length > 0)
+    if(line_len > 0){
+        ssize_t data_bytes = recv(socket_fd, buffer, line_len, MSG_WAITALL);
+        if(data_bytes != line_len){
+            // This indicates a problem, as MSG_WAITALL should have returned the full amount
+            return -1;
+        }
     }
     
-    buffer[line_len] = '\0'; // Null terminate the received string
-    return data_bytes;
+    buffer[line_len] = '\0'; // Null terminate the received string (even for empty messages)
+    return line_len;
 }
 
 //closes a socket connection

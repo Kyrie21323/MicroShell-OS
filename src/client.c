@@ -84,11 +84,9 @@ int main(int argc, char *argv[]){
         if (bytes_received < 0) {
             perror("Error receiving response from server");
             break;
-        } else if (bytes_received == 0) {
-            printf("[INFO] Server closed the connection.\n");
-            break;
         } else {
-            // Print the response from the server
+            // Print the response from the server (even if empty length 0 message)
+            // bytes_received == 0 means empty message, not connection closed
             printf("%s", response_buffer);
             fflush(stdout);
         }

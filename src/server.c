@@ -1,11 +1,15 @@
 #include "net.h"
 #include "parse.h"
 #include "exec.h"
-#include "util.h" // <--- ADDED THIS LINE
+#include "util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <errno.h>
 
 #define MAX_CMD_LENGTH 1024 
 #define MAX_ARGS 64         
@@ -13,16 +17,23 @@
 static int server_fd = -1;
 static int client_fd = -1;
 
-void signal_handler(int sig){
-    (void)sig; // <--- ADDED THIS LINE to fix the unused parameter warning
-    printf("\n[INFO] Shutting down server...\n");
-    if(client_fd >= 0){
-        close_socket(client_fd);
-    }
+static volatile sig_atomic_t g_stop = 0;
+
+void sigint_handler(int sig){
+    (void)sig;
+    printf("\n[INFO] SIGINT received, stopping...\n");
+    g_stop = 1;
     if(server_fd >= 0){
-        close_socket(server_fd);
+        shutdown(server_fd, SHUT_RDWR);
     }
-    exit(0);
+}
+
+void sigchld_handler(int sig){
+    (void)sig;
+    int status;
+    while(waitpid(-1, &status, WNOHANG) > 0){
+        // Reap all zombie children
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -40,8 +51,8 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    signal(SIGINT, sigint_handler);
+    signal(SIGCHLD, sigchld_handler);
 
     server_fd = create_server_socket(port);
     if(server_fd < 0){
@@ -51,9 +62,16 @@ int main(int argc, char *argv[]) {
 
     printf("[INFO] Server started on port %d, waiting for client connections...\n", port);
 
-    while (1){
+    while (!g_stop){
         client_fd = accept_client_connection(server_fd);
         if(client_fd < 0){
+            if(g_stop){
+                printf("[INFO] Shutting down server...\n");
+                break;
+            }
+            if(errno == EINTR){
+                continue;
+            }
             fprintf(stderr, "Error: Failed to accept client connection\n");
             continue;
         }
@@ -61,12 +79,19 @@ int main(int argc, char *argv[]) {
         printf("[INFO] Client connected.\n");
 
         while(1){
+            if(g_stop){
+                break;
+            }
+            
             int bytes_received = receive_line(client_fd, cmd_buffer, sizeof(cmd_buffer));
             
             if(bytes_received <= 0){
                 if(bytes_received == 0){
-                    printf("[INFO] Client disconnected\n");
+                    printf("[INFO] Client disconnected.\n");
                 } else {
+                    if(errno == EINTR){
+                        continue;
+                    }
                     perror("Error receiving command");
                 }
                 break;
@@ -116,11 +141,13 @@ int main(int argc, char *argv[]) {
                     printf("[OUTPUT] Sending output to client:\n%s\n", output_str);
                 }
             } else {
+                 // Empty output is normal for commands with redirections (e.g., echo hi > file.txt)
                  printf("[OUTPUT] Sending empty output to client.\n");
             }
 
 
-            // Send the result back to the client
+            // Send the result back to the client (always send, even if empty)
+            // This ensures the client doesn't hang waiting for a response
             if (send_line(client_fd, output_str ? output_str : "") < 0) {
                 perror("Error sending output to client");
             }
@@ -132,9 +159,21 @@ int main(int argc, char *argv[]) {
 
         close_socket(client_fd);
         client_fd = -1;
-        printf("[INFO] Client session ended\n");
+        printf("[INFO] Client session ended.\n");
+        
+        if(g_stop){
+            printf("[INFO] Shutting down server...\n");
+            break;
+        }
     }
 
-    close_socket(server_fd);
+    if(client_fd >= 0){
+        close_socket(client_fd);
+    }
+    if(server_fd >= 0){
+        close_socket(server_fd);
+    }
+    
+    printf("[INFO] Server socket closed. Bye.\n");
     return 0;
 }
