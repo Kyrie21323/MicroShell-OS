@@ -2,6 +2,7 @@
 #include "parse.h"
 #include "redir.h"
 #include "util.h"
+#include "errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,8 +94,8 @@ char* execute_command(char *args[], char *inputFile, char *outputFile, char *err
         close(output_pipe[1]);
         
         if (execvp(args[0], args) < 0) {
-            fprintf(stderr, "Command not found: %s\n", args[0]);
-            exit(EXIT_FAILURE);
+            dprintf(STDERR_FILENO, "Command not found: %s\n", args[0]);
+            _exit(127);
         }
     } else { // Parent process
         close(output_pipe[1]);
@@ -109,18 +110,18 @@ char* execute_command(char *args[], char *inputFile, char *outputFile, char *err
     return xstrdup("");
 }
 
-char* execute_pipeline(char *cmd) {
+char* execute_pipeline(char *cmd, int client_fd) {
     int validation_err = validate_pipeline(cmd);
     if (validation_err != VALIDATE_SUCCESS) {
         switch (validation_err) {
             case VALIDATE_ERR_STARTS_PIPE:
-                return xstrdup("Invalid pipeline: starts with pipe.\n");
+                return xstrdup(ERR_CMD_MISSING_BEFORE_PIPE);
             case VALIDATE_ERR_EMPTY_CMD:
-                return xstrdup("Invalid pipeline: empty command between pipes.\n");
+                return xstrdup(ERR_EMPTY_CMD_BETWEEN_PIPES);
             case VALIDATE_ERR_ENDS_PIPE:
-                return xstrdup("Command missing after pipe.\n");
+                return xstrdup(ERR_CMD_MISSING_AFTER_PIPE);
             default:
-                return xstrdup("Invalid pipeline syntax.\n");
+                return xstrdup(ERR_CMD_MISSING_AFTER_PIPE);
         }
     }
     
@@ -141,10 +142,12 @@ char* execute_pipeline(char *cmd) {
                 if(stages[i].errorFile) free(stages[i].errorFile);
             }
             switch (parse_res) {
-                case PARSE_ERR_NO_INPUT_FILE: return xstrdup("Input file not specified.\n");
-                case PARSE_ERR_NO_OUTPUT_FILE: return xstrdup("Output file not specified after redirection.\n");
-                case PARSE_ERR_NO_ERROR_FILE: return xstrdup("Error output file not specified.\n");
-                default: return xstrdup("Command parsing failed in pipeline.\n");
+                case PARSE_ERR_NO_INPUT_FILE: return xstrdup(ERR_INPUT_NOT_SPECIFIED);
+                case PARSE_ERR_NO_OUTPUT_FILE: return xstrdup(ERR_OUTPUT_NOT_SPECIFIED);
+                case PARSE_ERR_NO_OUTPUT_FILE_AFTER: return xstrdup(ERR_OUT_AFTER);
+                case PARSE_ERR_NO_ERROR_FILE: return xstrdup(ERR_ERROR_NOT_SPECIFIED);
+                case PARSE_ERR_UNCLOSED_QUOTES: return xstrdup(ERR_UNCLOSED_QUOTES);
+                default: return xstrdup("");
             }
         }
         numStages++;
@@ -174,49 +177,86 @@ char* execute_pipeline(char *cmd) {
             perror("fork failed");
             return xstrdup("");
         } else if (pids[i] == 0) {
+            // CHILD PROCESS
             close(capture_pipe[0]);
 
+            // Setup STDIN: first stage gets /dev/null if no explicit input redirection
+            if (i == 0) {
+                if (!stages[i].inputFile) {
+                    // Feed EOF to first stage to prevent blocking on user input
+                    int devnull = open("/dev/null", O_RDONLY);
+                    if (devnull >= 0) {
+                        dup2(devnull, STDIN_FILENO);
+                        close(devnull);
+                    }
+                } else {
+                    if(setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0) _exit(EXIT_FAILURE);
+                }
+            } else {
+                // Connect to previous stage's pipe
+                if (!stages[i].inputFile) {
+                    dup2(pipes[i - 1][0], STDIN_FILENO);
+                } else {
+                    if(setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0) _exit(EXIT_FAILURE);
+                }
+            }
+            
+            // Setup STDOUT
+            if (i < numStages - 1) {
+                // Middle stages write to next pipe
+                if (!stages[i].outputFile) {
+                    dup2(pipes[i][1], STDOUT_FILENO);
+                } else {
+                    if(setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
+                }
+            } else {
+                // Last stage writes to capture pipe
+                if (!stages[i].outputFile) {
+                    dup2(capture_pipe[1], STDOUT_FILENO);
+                } else {
+                    if(setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
+                }
+            }
+
+            // Setup STDERR: redirect to capture pipe so errors are collected with stdout
+            // We'll handle errors in the parent and send them via the protocol
             if (!stages[i].errorFile) {
                 dup2(capture_pipe[1], STDERR_FILENO);
-            }
-
-            if (i > 0 && !stages[i].inputFile) {
-                dup2(pipes[i - 1][0], STDIN_FILENO);
+            } else {
+                if(setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0) _exit(EXIT_FAILURE);
             }
             
-            if (i < numStages - 1 && !stages[i].outputFile) {
-                dup2(pipes[i][1], STDOUT_FILENO);
-            } else if (i == numStages - 1 && !stages[i].outputFile) {
-                dup2(capture_pipe[1], STDOUT_FILENO);
-            }
-
-            if(stages[i].inputFile && setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0) exit(EXIT_FAILURE);
-            if(stages[i].outputFile && setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) exit(EXIT_FAILURE);
-            if(stages[i].errorFile && setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0) exit(EXIT_FAILURE);
-            
+            // Close all pipe file descriptors in child (after dup2, we have copies)
             for (int j = 0; j < numStages - 1; j++) {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
             close(capture_pipe[1]);
             
+            // Execute command
             if (execvp(stages[i].args[0], stages[i].args) < 0) {
-                fprintf(stderr, "Command not found: %s\n", stages[i].args[0]);
-                exit(EXIT_FAILURE);
+                // execvp failed - write error to stderr (which goes to capture pipe)
+                dprintf(STDERR_FILENO, "Command not found in pipe sequence: %s\n", stages[i].args[0]);
+                _exit(127);
             }
         }
+        // PARENT: Continue spawning remaining stages regardless of previous results
     }
     
+    // Close all pipe file descriptors in parent (children have what they need)
     close(capture_pipe[1]);
     for (int i = 0; i < numStages - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
     
+    // Wait for all children to complete (handle failures gracefully)
     for (int i = 0; i < numStages; i++) {
         waitpid(pids[i], NULL, 0);
     }
 
+    // Read both stdout and stderr from capture pipe (they're both redirected there)
+    // This includes error messages from failed execvp calls
     char* output = read_output_from_fd(capture_pipe[0]);
     close(capture_pipe[0]);
 

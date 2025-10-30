@@ -1,10 +1,12 @@
 #include "parse.h"
 #include "tokenize.h"
 #include "util.h"
+#include "errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 
 #define MAX_CMD_LENGTH 1024 
@@ -53,7 +55,7 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
 
     QTok *toks=NULL; int nt=0;
     if(qtokenize(cmd, &toks, &nt)!=0){
-        args[0]=NULL; return PARSE_ERR_SYNTAX;
+        args[0]=NULL; return PARSE_ERR_UNCLOSED_QUOTES;
     }
     if(nt==0){ args[0]=NULL; free_qtokens(toks,nt); return PARSE_ERR_SYNTAX; }
 
@@ -76,10 +78,10 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
 
     for(int i=0;i<ac;i++){
         if(!quoted[i] && (strcmp(args[i],"<")==0 || strcmp(args[i],">")==0 || strcmp(args[i],"2>")==0)){
-            if(i+1>=ac){ 
+            if(i+1>=ac || args[i+1] == NULL || strlen(args[i+1]) == 0){ 
                 int err_code = PARSE_ERR_SYNTAX;
                 if(strcmp(args[i],"<")==0) err_code = PARSE_ERR_NO_INPUT_FILE;
-                else if(strcmp(args[i],">")==0) err_code = PARSE_ERR_NO_OUTPUT_FILE;
+                else if(strcmp(args[i],">")==0) err_code = isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
                 else err_code = PARSE_ERR_NO_ERROR_FILE;
 
                 for(int k=0;k<ac;k++) free(args[k]);
@@ -92,15 +94,44 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
     char *argv2[MAX_ARGS]; bool quoted2[MAX_ARGS]; int m=0;
     for(int i=0;i<ac;i++){
         if(!quoted[i] && strcmp(args[i],"<")==0){
-            *inputFile = strip_outer_quotes(args[i+1]); 
+            char *fname = strip_outer_quotes(args[i+1]);
+            if(fname == NULL || strlen(fname) == 0){
+                if(fname) free(fname);
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                return PARSE_ERR_NO_INPUT_FILE;
+            }
+            *inputFile = fname;
             free(args[i]); free(args[i+1]);
             i++; continue;
         }else if(!quoted[i] && strcmp(args[i],">")==0){
-            *outputFile = strip_outer_quotes(args[i+1]); 
+            // Check if filename is missing or empty
+            if(i+1 >= ac || args[i+1] == NULL || strlen(args[i+1]) == 0){
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                // Use "after redirection" message when in pipeline context
+                return isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
+            }
+            char *fname = strip_outer_quotes(args[i+1]);
+            if(fname == NULL || strlen(fname) == 0){
+                if(fname) free(fname);
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                // Use "after redirection" message when in pipeline context
+                return isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
+            }
+            *outputFile = fname;
             free(args[i]); free(args[i+1]);
             i++; continue;
         }else if(!quoted[i] && strcmp(args[i],"2>")==0){
-            *errorFile = strip_outer_quotes(args[i+1]);
+            char *fname = strip_outer_quotes(args[i+1]);
+            if(fname == NULL || strlen(fname) == 0){
+                if(fname) free(fname);
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                return PARSE_ERR_NO_ERROR_FILE;
+            }
+            *errorFile = fname;
             free(args[i]); free(args[i+1]);
             i++; continue;
         }else{

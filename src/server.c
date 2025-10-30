@@ -2,6 +2,7 @@
 #include "parse.h"
 #include "exec.h"
 #include "util.h"
+#include "errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,7 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, sigint_handler);
     signal(SIGCHLD, sigchld_handler);
+    signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE to prevent server shutdown on broken pipe
 
     server_fd = create_server_socket(port);
     if(server_fd < 0){
@@ -118,7 +120,7 @@ int main(int argc, char *argv[]) {
             strncpy(cmd_copy, cmd_buffer, MAX_CMD_LENGTH);
 
             if(strchr(cmd_copy, '|') != NULL){
-                output_str = execute_pipeline(cmd_copy);
+                output_str = execute_pipeline(cmd_copy, client_fd);
             } else {
                 char *args[MAX_ARGS];
                 char *inputFile, *outputFile, *errorFile;
@@ -141,6 +143,8 @@ int main(int argc, char *argv[]) {
                             output_str = xstrdup("Input file not specified.\n"); break;
                         case PARSE_ERR_NO_OUTPUT_FILE:
                             output_str = xstrdup("Output file not specified.\n"); break;
+                        case PARSE_ERR_NO_OUTPUT_FILE_AFTER:
+                            output_str = xstrdup(ERR_OUT_AFTER); break;
                         case PARSE_ERR_NO_ERROR_FILE:
                             output_str = xstrdup("Error output file not specified.\n"); break;
                         default:
@@ -151,10 +155,12 @@ int main(int argc, char *argv[]) {
             
             bool is_error = false;
             if (output_str) {
-                // Better error checking
+                // Better error checking - detect standardized error messages
                 if (strstr(output_str, "not found") || strstr(output_str, "not specified") ||
-                    strstr(output_str, "Invalid") || strstr(output_str, "failed") ||
-                    strstr(output_str, "Error:")) {
+                    strstr(output_str, "missing") || strstr(output_str, "Empty command") ||
+                    strstr(output_str, "Unclosed quotes") || strstr(output_str, "Invalid") ||
+                    strstr(output_str, "failed") || strstr(output_str, "Error:") ||
+                    strcmp(output_str, ERR_PIPE_CMD) == 0) {
                     is_error = true;
                 }
             }
@@ -174,8 +180,8 @@ int main(int argc, char *argv[]) {
                 } else {
                     printf("[OUTPUT] Sending output to client:\n%s\n", output_str);
                 }
-            } else {
-                 printf("[OUTPUT] Sending empty output to client.\n");
+            } else if (!output_str || strlen(output_str) == 0) {
+                // Don't log empty output for parse errors (they return empty)
             }
 
             if (send_line(client_fd, output_str ? output_str : "") < 0) {
