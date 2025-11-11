@@ -12,8 +12,9 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <pthread.h>      // For threads
-#include <arpa/inet.h>    // For inet_ntoa
+#include <arpa/inet.h>    // For inet_ntop
 #include <netinet/in.h>   // For sockaddr_in
 
 #define MAX_CMD_LENGTH 1024 
@@ -30,6 +31,24 @@ static volatile sig_atomic_t g_stop = 0;
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int client_count = 0;
 
+// Mutex to protect logging (thread-safe output)
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * @brief Thread-safe logging helper function
+ * @param fmt Format string (like printf)
+ * @param ... Variable arguments for formatting
+ */
+static void log_msg(const char *fmt, ...) {
+    pthread_mutex_lock(&log_mutex);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
 /**
  * @brief Struct to pass data to a new client thread
  */
@@ -45,7 +64,7 @@ typedef struct {
  */
 void sigint_handler(int sig){
     (void)sig;
-    printf("\n[INFO] SIGINT received, stopping...\n");
+    log_msg("\n[INFO] SIGINT received, stopping...\n");
     g_stop = 1;
     if(server_fd >= 0){
         // This helps unblock the accept() call
@@ -113,19 +132,20 @@ void *handle_client(void *arg) {
         
         if(bytes_received <= 0){
             if(bytes_received == 0){
-                printf("[INFO] %s Client disconnected (EOF).\n", log_prefix);
+                log_msg("[INFO] %s Client disconnected.\n", log_prefix);
             } else if(errno != EINTR) { // Don't log error on signal interrupt
                 perror("Error receiving command");
             }
             break;
         }
 
-        // Log received command 
-        printf("[RECEIVED] %s Received command: \"%s\"\n", log_prefix, cmd_buffer);
+        // Log received command (with blank line before for readability)
+        log_msg("\n");
+        log_msg("[RECEIVED] %s Received command: \"%s\"\n", log_prefix, cmd_buffer);
 
         if(strcmp(cmd_buffer, "exit") == 0){
             // Log exit command 
-            printf("[INFO] %s Client requested disconnect. Closing connection.\n", log_prefix);
+            log_msg("[INFO] %s Client requested disconnect. Closing connection.\n", log_prefix);
             break;
         }
         if(strlen(cmd_buffer) == 0){
@@ -135,7 +155,7 @@ void *handle_client(void *arg) {
         }
         
         // Log execution 
-        printf("[EXECUTING] %s Executing command: \"%s\"\n", log_prefix, cmd_buffer);
+        log_msg("[EXECUTING] %s Executing command: \"%s\"\n", log_prefix, cmd_buffer);
 
         char *output_str = NULL;
         char cmd_copy[MAX_CMD_LENGTH];
@@ -148,10 +168,11 @@ void *handle_client(void *arg) {
         } else {
             char *args[MAX_ARGS];
             char *inputFile, *outputFile, *errorFile;
-            int parse_res = parse_command(cmd_copy, args, &inputFile, &outputFile, &errorFile, 0);
+            int outputAppend = 0;
+            int parse_res = parse_command(cmd_copy, args, &inputFile, &outputFile, &errorFile, 0, &outputAppend);
             
             if(parse_res == PARSE_SUCCESS){
-                output_str = execute_command(args, inputFile, outputFile, errorFile);
+                output_str = execute_command(args, inputFile, outputFile, errorFile, outputAppend);
                 
                 for(int i = 0; args[i] != NULL; i++) free(args[i]);
                 if(inputFile) free(inputFile);
@@ -189,26 +210,26 @@ void *handle_client(void *arg) {
         if (is_error(output_str)) {
             // Log error message 
             // Remove trailing newline for cleaner single-line log
-            char log_msg[MAX_CMD_LENGTH];
-            strncpy(log_msg, output_str, sizeof(log_msg) - 1);
-            log_msg[sizeof(log_msg) - 1] = '\0';
-            log_msg[strcspn(log_msg, "\n")] = 0; // Remove trailing newline
+            char error_msg[MAX_CMD_LENGTH];
+            strncpy(error_msg, output_str, sizeof(error_msg) - 1);
+            error_msg[sizeof(error_msg) - 1] = '\0';
+            error_msg[strcspn(error_msg, "\n")] = 0; // Remove trailing newline
             
-            printf("[ERROR] %s %s\n", log_prefix, log_msg);
+            log_msg("[ERROR] %s %s\n", log_prefix, error_msg);
             // Log sending error message [cite: 10]
-            printf("[OUTPUT] %s Sending error message to client: \"%s\"\n", log_prefix, log_msg);
+            log_msg("[OUTPUT] %s Sending error message to client: \"%s\"\n", log_prefix, error_msg);
         
         } else if (strlen(output_str) > 0) {
             // Log sending standard output [cite: 10]
-            printf("[OUTPUT] %s Sending output to client:\n%s", log_prefix, output_str);
+            log_msg("[OUTPUT] %s Sending output to client:\n%s", log_prefix, output_str);
             // Add a newline to log if output didn't have one
             if(output_str[strlen(output_str)-1] != '\n') {
-                printf("\n");
+                log_msg("\n");
             }
         } else {
             // Don't log anything for empty, non-error output (e.g., successful touch)
             // But log that we are sending the (empty) response
-            printf("[OUTPUT] %s Sending output to client: \n", log_prefix);
+            log_msg("[OUTPUT] %s Sending output to client: \n", log_prefix);
         }
 
         // Send the result (error or success)
@@ -221,7 +242,7 @@ void *handle_client(void *arg) {
 
     close_socket(client_fd);
     // Log final disconnect message [cite: 10]
-    printf("[INFO] Client #%d disconnected.\n", client_id);
+    log_msg("[INFO] [Client #%d - %s:%d] Client disconnected.\n", client_id, client_ip, client_port);
     return NULL;
 }
 
@@ -229,18 +250,10 @@ void *handle_client(void *arg) {
  * @brief Main server function
  */
 int main(int argc, char *argv[]) {
-    int port;
-
-    if(argc != 2){
-        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
-
-    port = atoi(argv[1]);
-    if(port <= 0 || port > 65535){
-        fprintf(stderr, "Error: Invalid port number\n");
-        exit(1);
-    }
+    // Use default port 8080 (no command-line arguments required)
+    int port = 8080;
+    (void)argc;  // Suppress unused parameter warning
+    (void)argv;  // Suppress unused parameter warning
 
     signal(SIGINT, sigint_handler);
     signal(SIGCHLD, sigchld_handler);
@@ -252,7 +265,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("[INFO] Server started, waiting for client connections...\n");
+    log_msg("[INFO] Server started, waiting for client connections...\n");
 
     while (!g_stop){
         struct sockaddr_in client_addr; // To store client's IP and port
@@ -278,7 +291,7 @@ int main(int argc, char *argv[]) {
         // Get client info
         client_data->client_fd = client_fd;
         client_data->client_port = ntohs(client_addr.sin_port);
-        strncpy(client_data->client_ip, inet_ntoa(client_addr.sin_addr), INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_data->client_ip, INET_ADDRSTRLEN);
 
         // Safely assign a new client ID
         pthread_mutex_lock(&client_mutex);
@@ -287,7 +300,7 @@ int main(int argc, char *argv[]) {
         pthread_mutex_unlock(&client_mutex);
 
         // Log the new connection as required [cite: 10]
-        printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
+        log_msg("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
                client_data->client_id,
                client_data->client_ip,
                client_data->client_port,
@@ -309,6 +322,6 @@ int main(int argc, char *argv[]) {
         close_socket(server_fd);
     }
     
-    printf("[INFO] Server socket closed. Bye.\n");
+    log_msg("[INFO] Server socket closed. Bye.\n");
     return 0;
 }

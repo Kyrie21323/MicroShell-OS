@@ -85,10 +85,11 @@ int main() {
             }
             if(output) free(output);
         }else{
-            int parse_res = parse_command(cmd, args, &inputFile, &outputFile, &errorFile, 0);
+            int outputAppend = 0;
+            int parse_res = parse_command(cmd, args, &inputFile, &outputFile, &errorFile, 0, &outputAppend);
             if(parse_res == PARSE_SUCCESS){
                 //single command - parse and execute if parsing succeeded
-                char* output = execute_command(args, inputFile, outputFile, errorFile);
+                char* output = execute_command(args, inputFile, outputFile, errorFile, outputAppend);
                 if(output) {
                     // Check if output is an error message
                     if(is_error_message(output)) {

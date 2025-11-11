@@ -19,23 +19,13 @@ void signal_handler(int sig){
 }
 
 int main(int argc, char *argv[]){
-    char *server_ip;
-    int port;
+    // Use default server IP and port (no command-line arguments required)
+    char *server_ip = "127.0.0.1";
+    int port = 8080;
     char cmd_buffer[MAX_CMD_LENGTH];
     char response_buffer[MAX_RESPONSE_LENGTH];
-
-    if(argc != 3){
-        fprintf(stderr, "Usage: %s <server_ip> <port>\n", argv[0]);
-        exit(1);
-    }
-
-    server_ip = argv[1];
-    port = atoi(argv[2]);
-    
-    if(port <= 0 || port > 65535){
-        fprintf(stderr, "Error: Invalid port number\n");
-        exit(1);
-    }
+    (void)argc;  // Suppress unused parameter warning
+    (void)argv;  // Suppress unused parameter warning
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);

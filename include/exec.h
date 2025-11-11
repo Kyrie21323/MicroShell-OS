@@ -2,7 +2,7 @@
 #define EXEC_H
 
 // Executes a single command, captures its output/error, and returns it as a string.
-char* execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile);
+char* execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile, int outputAppend);
 
 // Executes a pipeline, captures the final output/error, and returns it as a string.
 // client_fd is used for stderr redirection in children and should be the client socket.

@@ -49,9 +49,10 @@ int validate_pipeline(char *cmd){
     return VALIDATE_SUCCESS;
 }
 
-int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline){
+int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline, int *outputAppend){
     (void)isPipeline; // isPipeline is now handled by the caller based on error code
     *inputFile = *outputFile = *errorFile = NULL;
+    if(outputAppend) *outputAppend = 0; // Default to truncate mode
 
     QTok *toks=NULL; int nt=0;
     if(qtokenize(cmd, &toks, &nt)!=0){
@@ -77,11 +78,11 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
     free(toks); // The container is freed, but the strings are now owned by 'args'
 
     for(int i=0;i<ac;i++){
-        if(!quoted[i] && (strcmp(args[i],"<")==0 || strcmp(args[i],">")==0 || strcmp(args[i],"2>")==0)){
+        if(!quoted[i] && (strcmp(args[i],"<")==0 || strcmp(args[i],">")==0 || strcmp(args[i],">>")==0 || strcmp(args[i],"2>")==0)){
             if(i+1>=ac || args[i+1] == NULL || strlen(args[i+1]) == 0){ 
                 int err_code = PARSE_ERR_SYNTAX;
                 if(strcmp(args[i],"<")==0) err_code = PARSE_ERR_NO_INPUT_FILE;
-                else if(strcmp(args[i],">")==0) err_code = isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
+                else if(strcmp(args[i],">")==0 || strcmp(args[i],">>")==0) err_code = isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
                 else err_code = PARSE_ERR_NO_ERROR_FILE;
 
                 for(int k=0;k<ac;k++) free(args[k]);
@@ -104,6 +105,26 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
             *inputFile = fname;
             free(args[i]); free(args[i+1]);
             i++; continue;
+        }else if(!quoted[i] && strcmp(args[i],">>")==0){
+            // Check if filename is missing or empty
+            if(i+1 >= ac || args[i+1] == NULL || strlen(args[i+1]) == 0){
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                // Use "after redirection" message when in pipeline context
+                return isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
+            }
+            char *fname = strip_outer_quotes(args[i+1]);
+            if(fname == NULL || strlen(fname) == 0){
+                if(fname) free(fname);
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; 
+                // Use "after redirection" message when in pipeline context
+                return isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
+            }
+            *outputFile = fname;
+            if(outputAppend) *outputAppend = 1; // Set append mode
+            free(args[i]); free(args[i+1]);
+            i++; continue;
         }else if(!quoted[i] && strcmp(args[i],">")==0){
             // Check if filename is missing or empty
             if(i+1 >= ac || args[i+1] == NULL || strlen(args[i+1]) == 0){
@@ -121,6 +142,7 @@ int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, 
                 return isPipeline ? PARSE_ERR_NO_OUTPUT_FILE_AFTER : PARSE_ERR_NO_OUTPUT_FILE;
             }
             *outputFile = fname;
+            if(outputAppend) *outputAppend = 0; // Set truncate mode
             free(args[i]); free(args[i+1]);
             i++; continue;
         }else if(!quoted[i] && strcmp(args[i],"2>")==0){

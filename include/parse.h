@@ -18,7 +18,7 @@
 #define VALIDATE_ERR_EMPTY_CMD 2
 #define VALIDATE_ERR_ENDS_PIPE 3
 
-int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline);
+int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline, int *outputAppend);
 int validate_pipeline(char *cmd);
 
 #endif

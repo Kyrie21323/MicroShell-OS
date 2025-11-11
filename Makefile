@@ -70,10 +70,10 @@ run: myshell
 	./myshell
 
 run-server: server
-	./server 5050
+	./server
 
 run-client: client
-	./client 127.0.0.1 5050
+	./client
 
 clean:
 	rm -rf $(OBJDIR) $(TARGETS)

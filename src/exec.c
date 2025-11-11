@@ -20,6 +20,7 @@ typedef struct {
     char *inputFile;
     char *outputFile;
     char *errorFile;
+    int outputAppend;  // 1 for append (>>), 0 for truncate (>)
 } Stage;
 
 static char* skip_whitespace(char *str){
@@ -56,7 +57,7 @@ static char* read_output_from_fd(int fd) {
     return buffer;
 }
 
-char* execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile) {
+char* execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile, int outputAppend) {
     int output_pipe[2];
     if (pipe(output_pipe) < 0) {
         perror("pipe failed");
@@ -84,8 +85,12 @@ char* execute_command(char *args[], char *inputFile, char *outputFile, char *err
         if (inputFile && setup_redirection(inputFile, O_RDONLY, STDIN_FILENO) < 0) {
             exit(EXIT_FAILURE);
         }
-        if (outputFile && setup_redirection(outputFile, O_WRONLY | O_CREAT | O_TRUNC, STDOUT_FILENO) < 0) {
-            exit(EXIT_FAILURE);
+        if (outputFile) {
+            int flags = O_WRONLY | O_CREAT;
+            flags |= outputAppend ? O_APPEND : O_TRUNC;
+            if (setup_redirection(outputFile, flags, STDOUT_FILENO) < 0) {
+                exit(EXIT_FAILURE);
+            }
         }
         if (errorFile && setup_redirection(errorFile, O_WRONLY | O_CREAT | O_TRUNC, STDERR_FILENO) < 0) {
             exit(EXIT_FAILURE);
@@ -111,6 +116,7 @@ char* execute_command(char *args[], char *inputFile, char *outputFile, char *err
 }
 
 char* execute_pipeline(char *cmd, int client_fd) {
+    (void)client_fd;  // Explicitly mark as unused
     int validation_err = validate_pipeline(cmd);
     if (validation_err != VALIDATE_SUCCESS) {
         switch (validation_err) {
@@ -133,7 +139,8 @@ char* execute_pipeline(char *cmd, int client_fd) {
     
     while (stage_cmd != NULL && numStages < MAX_PIPES) {
         stage_cmd = skip_whitespace(stage_cmd);
-        int parse_res = parse_command(stage_cmd, stages[numStages].args, &stages[numStages].inputFile, &stages[numStages].outputFile, &stages[numStages].errorFile, 1);
+        stages[numStages].outputAppend = 0;  // Initialize to truncate mode
+        int parse_res = parse_command(stage_cmd, stages[numStages].args, &stages[numStages].inputFile, &stages[numStages].outputFile, &stages[numStages].errorFile, 1, &stages[numStages].outputAppend);
         if (parse_res != PARSE_SUCCESS) {
             for (int i = 0; i < numStages; i++) {
                 for (int j = 0; stages[i].args[j] != NULL; j++) free(stages[i].args[j]);
@@ -207,14 +214,18 @@ char* execute_pipeline(char *cmd, int client_fd) {
                 if (!stages[i].outputFile) {
                     dup2(pipes[i][1], STDOUT_FILENO);
                 } else {
-                    if(setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
+                    int flags = O_WRONLY | O_CREAT;
+                    flags |= stages[i].outputAppend ? O_APPEND : O_TRUNC;
+                    if(setup_redirection(stages[i].outputFile, flags, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
                 }
             } else {
                 // Last stage writes to capture pipe
                 if (!stages[i].outputFile) {
                     dup2(capture_pipe[1], STDOUT_FILENO);
                 } else {
-                    if(setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
+                    int flags = O_WRONLY | O_CREAT;
+                    flags |= stages[i].outputAppend ? O_APPEND : O_TRUNC;
+                    if(setup_redirection(stages[i].outputFile, flags, STDOUT_FILENO) < 0) _exit(EXIT_FAILURE);
                 }
             }
 

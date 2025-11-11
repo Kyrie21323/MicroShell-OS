@@ -42,6 +42,11 @@ int qtokenize(const char *line, QTok **out, int *count){
                 if(*p=='\''){ in_s=true; p++; continue; }
                 if(*p=='"'){ in_d=true; p++; continue; }
                 if(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') break;
+                // Check for >> before checking for single >
+                if(*p=='>' && p[1]=='>'){
+                    if(bl==0) break;  // >> is an operator, break to handle it separately
+                    else break;       // We have content, break to finish current token
+                }
                 if(*p=='|'||*p=='<'||*p=='>'){
                     if(bl==0) break;
                     else break;
@@ -64,6 +69,11 @@ int qtokenize(const char *line, QTok **out, int *count){
             if(*p=='2' && p[1]=='>'){
                 if(n==cap){ cap*=2; QTok *tmp=realloc(arr, cap*sizeof(QTok)); if(!tmp){ perror("realloc"); free(arr); return -1;} arr=tmp; }
                 arr[n].val = xstrdup("2>");
+                arr[n].was_quoted=false; n++; p+=2;
+            } else if(*p=='>' && p[1]=='>'){
+                // Handle >> (append redirection) as a single token
+                if(n==cap){ cap*=2; QTok *tmp=realloc(arr, cap*sizeof(QTok)); if(!tmp){ perror("realloc"); free(arr); return -1;} arr=tmp; }
+                arr[n].val = xstrdup(">>");
                 arr[n].was_quoted=false; n++; p+=2;
             } else if(*p=='|'||*p=='<'||*p=='>'){
                 char op[2]={*p,0};
