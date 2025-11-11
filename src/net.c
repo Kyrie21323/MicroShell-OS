@@ -43,12 +43,13 @@ int create_server_socket(int port){
 
 //accepts a client connection on the server socket, blocks until a client connects, returns client socket file descriptor on success, -1 on failure
 //Returns -1 on error (including EINTR), caller should check errno
-int accept_client_connection(int server_fd){
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
+// Modified to fill client_addr struct
+int accept_client_connection(int server_fd, struct sockaddr_in *client_addr){
+    int addrlen = sizeof(struct sockaddr_in);
     int client_fd;
 
-    if((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0){
+    // Use the passed client_addr struct to store address info
+    if((client_fd = accept(server_fd, (struct sockaddr *)client_addr, (socklen_t*)&addrlen)) < 0){
         // Don't print error for EINTR - it's handled by the caller
         if(errno != EINTR){
             perror("accept failed");
@@ -104,9 +105,11 @@ int send_line(int socket_fd, const char *line){
     }
 
     // Send the actual line data
-    if(send(socket_fd, line, len, 0) != len){
-        perror("send data failed");
-        return -1;
+    if(len > 0) { // Only send if there is data
+        if(send(socket_fd, line, len, 0) != len){
+            perror("send data failed");
+            return -1;
+        }
     }
 
     return len;
@@ -136,7 +139,8 @@ int receive_line(int socket_fd, char *buffer, int buffer_size){
             if(recv(socket_fd, discard_buffer, reading, MSG_WAITALL) <= 0) break;
             to_read -= reading;
         }
-        return -1;
+        buffer[0] = '\0'; // Return empty string
+        return -1; // Indicate error
     }
 
     // Receive the actual line data (if length > 0)
@@ -144,6 +148,7 @@ int receive_line(int socket_fd, char *buffer, int buffer_size){
         ssize_t data_bytes = recv(socket_fd, buffer, line_len, MSG_WAITALL);
         if(data_bytes != line_len){
             // This indicates a problem, as MSG_WAITALL should have returned the full amount
+            buffer[0] = '\0';
             return -1;
         }
     }
