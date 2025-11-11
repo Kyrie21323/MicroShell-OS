@@ -75,7 +75,8 @@ int main(int argc, char *argv[]){
         }
 
         if(strcmp(cmd_buffer, "exit") == 0){
-            printf("[INFO] Exiting client...\n");
+            // Changed this message to match the project screenshot 
+            printf("Disconnected from server.\n");
             break;
         }
         
@@ -85,8 +86,7 @@ int main(int argc, char *argv[]){
             perror("Error receiving response from server");
             break;
         } else {
-            // Print the response from the server (even if empty length 0 message)
-            // bytes_received == 0 means empty message, not connection closed
+            // Print the response from the server
             printf("%s", response_buffer);
             fflush(stdout);
         }
