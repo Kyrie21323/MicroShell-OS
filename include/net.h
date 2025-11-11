@@ -2,7 +2,7 @@
 #define NET_H
 
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <netinet/in.h> // <-- Added for sockaddr_in
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -15,7 +15,8 @@
 #define MAX_BUFFER_SIZE 1024
 
 int create_server_socket(int port);
-int accept_client_connection(int server_fd);
+// Modified to accept a pointer to store client address info
+int accept_client_connection(int server_fd, struct sockaddr_in *client_addr);
 int create_client_socket(const char *server_ip, int port);
 int send_line(int socket_fd, const char *line);
 int receive_line(int socket_fd, char *buffer, int buffer_size);
