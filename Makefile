@@ -1,8 +1,11 @@
 # Compiler and flags
 CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -O2
+# Add -pthread for threads
+CFLAGS  := -std=c11 -Wall -Wextra -O2 -pthread
 # Define POSIX for strtok_r and other POSIX functions
 CFLAGS += -D_POSIX_C_SOURCE=200809L
+# Add -pthread for linking
+LDFLAGS := -pthread
 
 INCDIR  := include
 SRCDIR  := src
@@ -47,15 +50,15 @@ all: $(TARGETS)
 
 # Build original shell
 myshell: $(SHELL_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 
 # Build server
 server: $(SERVER_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 
 # Build client
 client: $(CLIENT_OBJ)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
