@@ -3,325 +3,294 @@
 #include "exec.h"
 #include "util.h"
 #include "errors.h"
+#include "job.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <errno.h>
-#include <stdbool.h>
-#include <stdarg.h>
-#include <pthread.h>      // For threads
-#include <arpa/inet.h>    // For inet_ntop
-#include <netinet/in.h>   // For sockaddr_in
+#include <pthread.h> 
+#include <stdarg.h> // Required for va_list
 
 #define MAX_CMD_LENGTH 1024 
-#define MAX_ARGS 64         
-#define LOG_BUFFER_SIZE 2048 // For building log prefixes
-#define INET_ADDRSTRLEN 16   // For IPv4 address string
+#define SCHED_QUANTUM_1 3
+#define SCHED_QUANTUM_REST 7
 
+// Global State
 static int server_fd = -1;
-
-// Global flag to signal shutdown
 static volatile sig_atomic_t g_stop = 0;
+static int client_id_counter = 0;
+static int job_id_counter = 0;
 
-// Mutex to protect client_count
-static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int client_count = 0;
+// Scheduler Queue
+Job *job_queue_head = NULL;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
-// Mutex to protect logging (thread-safe output)
-static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/**
- * @brief Thread-safe logging helper function
- * @param fmt Format string (like printf)
- * @param ... Variable arguments for formatting
- */
-static void log_msg(const char *fmt, ...) {
-    pthread_mutex_lock(&log_mutex);
+// Logs
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+void safe_log(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
+    pthread_mutex_lock(&log_mutex);
     vprintf(fmt, args);
-    va_end(args);
     fflush(stdout);
     pthread_mutex_unlock(&log_mutex);
+    va_end(args);
 }
 
-/**
- * @brief Struct to pass data to a new client thread
- */
-typedef struct {
-    int client_fd;                // Client's socket file descriptor
-    int client_id;                // Unique ID for the client
-    char client_ip[INET_ADDRSTRLEN]; // Client's IP address
-    int client_port;              // Client's port
-} client_data_t;
-
-/**
- * @brief Signal handler for SIGINT (Ctrl+C)
- */
-void sigint_handler(int sig){
+// Signal Handler (Fixed: Standard C function instead of C++ lambda)
+void handle_sigint(int sig) {
     (void)sig;
-    log_msg("\n[INFO] SIGINT received, stopping...\n");
     g_stop = 1;
-    if(server_fd >= 0){
-        // This helps unblock the accept() call
-        shutdown(server_fd, SHUT_RDWR);
-    }
+    if(server_fd >= 0) close(server_fd);
+    // Wake up scheduler so it can exit
+    pthread_mutex_lock(&queue_mutex);
+    pthread_cond_broadcast(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
 }
 
-/**
- * @brief Signal handler for SIGCHLD (reaps zombie processes)
- */
-void sigchld_handler(int sig){
-    (void)sig;
-    int status;
-    while(waitpid(-1, &status, WNOHANG) > 0){
-        // Reap all zombie children
+// --- Queue Helpers ---
+
+void add_job(Job *new_job) {
+    pthread_mutex_lock(&queue_mutex);
+    
+    if (!job_queue_head) {
+        job_queue_head = new_job;
+    } else {
+        Job *curr = job_queue_head;
+        while (curr->next) curr = curr->next;
+        curr->next = new_job;
     }
+    
+    safe_log("(%d) created (%d)\n", new_job->client_id, new_job->initial_burst);
+    
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
 }
 
-/**
- * @brief Checks if an output string is a known error message.
- * @param output The string to check.
- * @return 1 if it's an error, 0 otherwise.
- */
-static bool is_error(const char *output_str) {
-    if (!output_str) return false;
-    if (strstr(output_str, "not found") || strstr(output_str, "not specified") ||
-        strstr(output_str, "missing") || strstr(output_str, "Empty command") ||
-        strstr(output_str, "Unclosed quotes") || strstr(output_str, "Invalid") ||
-        strstr(output_str, "failed") || strstr(output_str, "Error:") ||
-        strcmp(output_str, ERR_PIPE_CMD) == 0) {
-        return true;
-    }
-    return false;
-}
+// SRJF Selection Algorithm [cite: 13, 48]
+Job *select_job(int remove) {
+    if (!job_queue_head) return NULL;
 
-/**
- * @brief The main function for each client thread.
- * * This function handles all communication and command execution
- * for a single connected client[cite: 9].
- * * @param arg A void pointer to a client_data_t struct.
- * @return NULL
- */
-void *handle_client(void *arg) {
-    client_data_t *data = (client_data_t *)arg;
-    
-    // Copy data from the struct, then free it
-    int client_fd = data->client_fd;
-    int client_id = data->client_id;
-    char client_ip[INET_ADDRSTRLEN];
-    strncpy(client_ip, data->client_ip, INET_ADDRSTRLEN);
-    int client_port = data->client_port;
-    
-    // We've copied the data, so we can free the struct passed from main
-    free(data);
+    Job *best = job_queue_head;
+    Job *prev = NULL;
+    Job *best_prev = NULL;
 
-    char cmd_buffer[MAX_CMD_LENGTH];
-    char log_prefix[LOG_BUFFER_SIZE];
-    
-    // Create the client-specific log prefix for all messages
-    // Format: [Client #X - IP:PORT]
-    snprintf(log_prefix, sizeof(log_prefix), "[Client #%d - %s:%d]", client_id, client_ip, client_port);
+    Job *curr = job_queue_head;
+    Job *curr_prev = NULL;
 
-    while(!g_stop){
-        int bytes_received = receive_line(client_fd, cmd_buffer, sizeof(cmd_buffer));
-        
-        if(bytes_received <= 0){
-            if(bytes_received == 0){
-                log_msg("[INFO] %s Client disconnected.\n", log_prefix);
-            } else if(errno != EINTR) { // Don't log error on signal interrupt
-                perror("Error receiving command");
+    while (curr) {
+        // Priority 1: Shell Commands (burst == -1) [cite: 50]
+        if (curr->initial_burst == -1) {
+            if (best->initial_burst != -1) {
+                best = curr;
+                best_prev = curr_prev;
             }
-            break;
         }
-
-        // Log received command (with blank line before for readability)
-        log_msg("\n");
-        log_msg("[RECEIVED] %s Received command: \"%s\"\n", log_prefix, cmd_buffer);
-
-        if(strcmp(cmd_buffer, "exit") == 0){
-            // Log exit command 
-            log_msg("[INFO] %s Client requested disconnect. Closing connection.\n", log_prefix);
-            break;
-        }
-        if(strlen(cmd_buffer) == 0){
-            // Send back an empty response for an empty command
-            send_line(client_fd, "");
-            continue;
+        // Priority 2: Shortest Remaining Job (if neither is shell)
+        else if (best->initial_burst != -1) {
+            if (curr->remaining_time < best->remaining_time) {
+                best = curr;
+                best_prev = curr_prev;
+            }
         }
         
-        // Log execution 
-        log_msg("[EXECUTING] %s Executing command: \"%s\"\n", log_prefix, cmd_buffer);
+        curr_prev = curr;
+        curr = curr->next;
+    }
 
-        char *output_str = NULL;
-        char cmd_copy[MAX_CMD_LENGTH];
-        strncpy(cmd_copy, cmd_buffer, MAX_CMD_LENGTH);
-        cmd_copy[MAX_CMD_LENGTH - 1] = '\0'; // Ensure null-termination
-
-        // --- Execute Command ---
-        if(strchr(cmd_copy, '|') != NULL){
-            output_str = execute_pipeline(cmd_copy, client_fd);
+    if (remove && best) {
+        if (best_prev) {
+            best_prev->next = best->next;
         } else {
-            char *args[MAX_ARGS];
-            char *inputFile, *outputFile, *errorFile;
-            int outputAppend = 0;
-            int parse_res = parse_command(cmd_copy, args, &inputFile, &outputFile, &errorFile, 0, &outputAppend);
+            job_queue_head = best->next;
+        }
+        best->next = NULL;
+    }
+    return best;
+}
+
+// --- Execution Logic ---
+
+void run_shell_job(Job *job) {
+    safe_log("(%d) started (-1)\n", job->client_id);
+    
+    char *output = execute_pipeline(job->command, job->client_fd);
+    
+    if(output && strlen(output) > 0) {
+        safe_log("[%d]<<< %lu bytes sent\n", job->client_id, strlen(output));
+    }
+    
+    send_line(job->client_fd, output ? output : "");
+    if(output) free(output);
+    
+    safe_log("(%d) ended (-1)\n", job->client_id);
+}
+
+void run_demo_job(Job *job) {
+    int quantum = (job->rounds_run == 0) ? SCHED_QUANTUM_1 : SCHED_QUANTUM_REST; 
+    int time_slice = 0;
+
+    safe_log("(%d) started (%d)\n", job->client_id, job->remaining_time);
+    if(job->rounds_run > 0) {
+         safe_log("(%d) running (%d)\n", job->client_id, job->remaining_time);
+    }
+
+    while (time_slice < quantum && job->remaining_time > 0) {
+        sleep(1); // Simulate work [cite: 17]
+        
+        int current_progress = job->initial_burst - job->remaining_time + 1;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Demo %d/%d", current_progress, job->initial_burst);
+        send_line(job->client_fd, buf);
+
+        job->remaining_time--;
+        time_slice++;
+
+        // Preemption Check 
+        pthread_mutex_lock(&queue_mutex);
+        Job *potential_better = select_job(0);
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (potential_better && potential_better != job) {
+            if (potential_better->initial_burst == -1 || 
+                potential_better->remaining_time < job->remaining_time) {
+                break; // Preempt
+            }
+        }
+    }
+
+    job->rounds_run++;
+
+    if (job->remaining_time == 0) {
+        safe_log("(%d) ended (0)\n", job->client_id);
+    } else {
+        safe_log("(%d) waiting (%d)\n", job->client_id, job->remaining_time);
+    }
+}
+
+void *scheduler_loop(void *arg) {
+    (void)arg;
+    while (!g_stop) {
+        pthread_mutex_lock(&queue_mutex);
+        while (job_queue_head == NULL && !g_stop) {
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+        }
+        if (g_stop) { pthread_mutex_unlock(&queue_mutex); break; }
+        pthread_mutex_unlock(&queue_mutex);
+
+        pthread_mutex_lock(&queue_mutex);
+        Job *job = select_job(1); 
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (!job) continue;
+
+        if (job->type == JOB_CMD) {
+            run_shell_job(job);
+            send_line(job->client_fd, "<<EOF>>"); 
+            free(job->command);
+            free(job);
+        } else {
+            run_demo_job(job);
             
-            if(parse_res == PARSE_SUCCESS){
-                output_str = execute_command(args, inputFile, outputFile, errorFile, outputAppend);
-                
-                for(int i = 0; args[i] != NULL; i++) free(args[i]);
-                if(inputFile) free(inputFile);
-                if(outputFile) free(outputFile);
-                if(errorFile) free(errorFile);
+            if (job->remaining_time > 0) {
+                pthread_mutex_lock(&queue_mutex);
+                job->next = job_queue_head;
+                job_queue_head = job;
+                pthread_mutex_unlock(&queue_mutex);
             } else {
-                // Handle parsing errors
-                 switch (parse_res) {
-                    case PARSE_ERR_SYNTAX:
-                    case PARSE_ERR_EMPTY_CMD_REDIR:
-                        output_str = xstrdup("Error: Invalid command syntax.\n"); break;
-                    case PARSE_ERR_TOO_MANY_ARGS:
-                        output_str = xstrdup("Error: Too many arguments.\n"); break;
-                    case PARSE_ERR_NO_INPUT_FILE:
-                        output_str = xstrdup(ERR_INPUT_NOT_SPECIFIED); break;
-                    case PARSE_ERR_NO_OUTPUT_FILE:
-                        output_str = xstrdup(ERR_OUTPUT_NOT_SPECIFIED); break;
-                    case PARSE_ERR_NO_OUTPUT_FILE_AFTER:
-                        output_str = xstrdup(ERR_OUT_AFTER); break;
-                    case PARSE_ERR_NO_ERROR_FILE:
-                        output_str = xstrdup(ERR_ERROR_NOT_SPECIFIED); break;
-                    default:
-                        output_str = xstrdup("Error: Command parsing failed.\n");
-                }
+                send_line(job->client_fd, "<<EOF>>");
+                free(job->command);
+                free(job);
             }
         }
-        // --- End Execution ---
-        
-        // Ensure output is not NULL
-        if (!output_str) {
-            output_str = xstrdup("");
-        }
-
-        // Check if the result was an error
-        if (is_error(output_str)) {
-            // Log error message 
-            // Remove trailing newline for cleaner single-line log
-            char error_msg[MAX_CMD_LENGTH];
-            strncpy(error_msg, output_str, sizeof(error_msg) - 1);
-            error_msg[sizeof(error_msg) - 1] = '\0';
-            error_msg[strcspn(error_msg, "\n")] = 0; // Remove trailing newline
-            
-            log_msg("[ERROR] %s %s\n", log_prefix, error_msg);
-            // Log sending error message [cite: 10]
-            log_msg("[OUTPUT] %s Sending error message to client: \"%s\"\n", log_prefix, error_msg);
-        
-        } else if (strlen(output_str) > 0) {
-            // Log sending standard output [cite: 10]
-            log_msg("[OUTPUT] %s Sending output to client:\n%s", log_prefix, output_str);
-            // Add a newline to log if output didn't have one
-            if(output_str[strlen(output_str)-1] != '\n') {
-                log_msg("\n");
-            }
-        } else {
-            // Don't log anything for empty, non-error output (e.g., successful touch)
-            // But log that we are sending the (empty) response
-            log_msg("[OUTPUT] %s Sending output to client: \n", log_prefix);
-        }
-
-        // Send the result (error or success)
-        if (send_line(client_fd, output_str) < 0) {
-            perror("Error sending output to client");
-        }
-
-        free(output_str);
     }
-
-    close_socket(client_fd);
-    // Log final disconnect message [cite: 10]
-    log_msg("[INFO] [Client #%d - %s:%d] Client disconnected.\n", client_id, client_ip, client_port);
     return NULL;
 }
 
-/**
- * @brief Main server function
- */
-int main(int argc, char *argv[]) {
-    // Use default port 8080 (no command-line arguments required)
-    int port = 8080;
-    (void)argc;  // Suppress unused parameter warning
-    (void)argv;  // Suppress unused parameter warning
+typedef struct { int fd; int id; } client_t;
 
-    signal(SIGINT, sigint_handler);
-    signal(SIGCHLD, sigchld_handler);
-    signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE
+void *handle_client_input(void *arg) {
+    client_t *info = (client_t*)arg;
+    int client_fd = info->fd;
+    int client_id = info->id;
+    free(info);
 
-    server_fd = create_server_socket(port);
-    if(server_fd < 0){
-        fprintf(stderr, "Error: Failed to create server socket\n");
-        exit(1);
-    }
+    char buffer[MAX_CMD_LENGTH];
 
-    log_msg("[INFO] Server started, waiting for client connections...\n");
+    while (!g_stop) {
+        int bytes = receive_line(client_fd, buffer, sizeof(buffer));
+        if (bytes <= 0) break; 
+        if (strcmp(buffer, "exit") == 0) break;
+        if (strlen(buffer) == 0) continue;
 
-    while (!g_stop){
-        struct sockaddr_in client_addr; // To store client's IP and port
-        int client_fd = accept_client_connection(server_fd, &client_addr);
-        
-        if(client_fd < 0){
-            if(g_stop){ break; } // Normal shutdown
-            if(errno == EINTR){ continue; } // Interrupted by signal
-            fprintf(stderr, "Error: Failed to accept client connection\n");
-            continue;
+        safe_log("[%d] >>> %s\n", client_id, buffer);
+
+        Job *job = malloc(sizeof(Job));
+        job->id = ++job_id_counter;
+        job->client_id = client_id;
+        job->client_fd = client_fd;
+        job->command = xstrdup(buffer);
+        job->rounds_run = 0;
+        job->next = NULL;
+
+        // Parse demo command
+        if (strncmp(buffer, "demo", 4) == 0 || strncmp(buffer, "./demo", 6) == 0 || strncmp(buffer, "/demo", 5) == 0) {
+             job->type = JOB_DEMO;
+             char *space = strchr(buffer, ' ');
+             if (space) job->initial_burst = atoi(space + 1);
+             else job->initial_burst = 5; 
+             job->remaining_time = job->initial_burst;
+        } else {
+            job->type = JOB_CMD;
+            job->initial_burst = -1; 
+            job->remaining_time = 0; 
         }
 
-        // --- New Client Connected ---
-        
-        // Malloc data struct to pass to thread
-        client_data_t *client_data = malloc(sizeof(client_data_t));
-        if(!client_data){
-            perror("malloc failed");
-            close_socket(client_fd);
-            continue;
-        }
-
-        // Get client info
-        client_data->client_fd = client_fd;
-        client_data->client_port = ntohs(client_addr.sin_port);
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_data->client_ip, INET_ADDRSTRLEN);
-
-        // Safely assign a new client ID
-        pthread_mutex_lock(&client_mutex);
-        client_count++;
-        client_data->client_id = client_count;
-        pthread_mutex_unlock(&client_mutex);
-
-        // Log the new connection as required [cite: 10]
-        log_msg("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
-               client_data->client_id,
-               client_data->client_ip,
-               client_data->client_port,
-               client_data->client_id);
-
-        // Create the new thread
-        pthread_t thread_id;
-        if(pthread_create(&thread_id, NULL, handle_client, (void *)client_data) != 0){
-            perror("pthread_create failed");
-            free(client_data);
-            close_socket(client_fd);
-        }
-
-        // Detach the thread so its resources are freed on exit
-        pthread_detach(thread_id);
-    }
-
-    if(server_fd >= 0){
-        close_socket(server_fd);
+        add_job(job);
     }
     
-    log_msg("[INFO] Server socket closed. Bye.\n");
+    close_socket(client_fd);
+    safe_log("[%d] <<< client disconnected\n", client_id);
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+    
+    // FIXED: Use standard function pointer, not lambda
+    signal(SIGINT, handle_sigint);
+    signal(SIGPIPE, SIG_IGN);
+
+    server_fd = create_server_socket(8080);
+    if(server_fd < 0) exit(1);
+
+    printf("-------------------------\n");
+    printf("| Hello, Server Started |\n");
+    printf("-------------------------\n");
+
+    pthread_t sched_tid;
+    pthread_create(&sched_tid, NULL, scheduler_loop, NULL);
+
+    while(!g_stop) {
+        struct sockaddr_in addr;
+        int cf = accept_client_connection(server_fd, &addr);
+        if (cf < 0) continue;
+
+        if (g_stop) { close(cf); break; }
+
+        int cid = ++client_id_counter;
+        safe_log("[%d] <<< client connected\n", cid);
+
+        client_t *c = malloc(sizeof(client_t));
+        c->fd = cf; c->id = cid;
+        
+        pthread_t tid;
+        pthread_create(&tid, NULL, handle_client_input, c);
+        pthread_detach(tid);
+    }
+    
     return 0;
 }
