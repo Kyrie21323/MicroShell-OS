@@ -25,6 +25,7 @@ static int job_id_counter = 0;
 
 // Scheduler Queue
 Job *job_queue_head = NULL;
+Job *current_running_job = NULL;  // Track currently running job for preemption checks
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
@@ -71,17 +72,40 @@ void add_job(Job *new_job) {
 }
 
 // SRJF Selection Algorithm [cite: 13, 48]
-Job *select_job(int remove) {
+// If exclude is non-NULL, excludes that job from selection (for preemption checks)
+Job *select_job(int remove, Job *exclude) {
     if (!job_queue_head) return NULL;
 
-    Job *best = job_queue_head;
-    Job *prev = NULL;
+    Job *best = NULL;
     Job *best_prev = NULL;
 
     Job *curr = job_queue_head;
     Job *curr_prev = NULL;
 
+    // Find first non-excluded job as initial best
+    while (curr && !best) {
+        if (curr != exclude) {
+            best = curr;
+            best_prev = curr_prev;
+        }
+        curr_prev = curr;
+        curr = curr->next;
+    }
+
+    if (!best) return NULL;  // All jobs are excluded or queue empty
+
+    // Continue from where we left off
+    curr = best->next;
+    curr_prev = best;
+
     while (curr) {
+        // Skip excluded job
+        if (curr == exclude) {
+            curr_prev = curr;
+            curr = curr->next;
+            continue;
+        }
+
         // Priority 1: Shell Commands (burst == -1) [cite: 50]
         if (curr->initial_burst == -1) {
             if (best->initial_burst != -1) {
@@ -114,6 +138,17 @@ Job *select_job(int remove) {
 
 // --- Execution Logic ---
 
+// Safe send that handles client disconnects gracefully
+static int safe_send_line(int client_fd, const char *line) {
+    if (client_fd < 0) return -1;
+    int result = send_line(client_fd, line);
+    // If send fails, client likely disconnected - don't crash
+    if (result < 0) {
+        // Client disconnected, but continue execution for logging
+    }
+    return result;
+}
+
 void run_shell_job(Job *job) {
     safe_log("(%d) started (-1)\n", job->client_id);
     
@@ -123,7 +158,7 @@ void run_shell_job(Job *job) {
         safe_log("[%d]<<< %lu bytes sent\n", job->client_id, strlen(output));
     }
     
-    send_line(job->client_fd, output ? output : "");
+    safe_send_line(job->client_fd, output ? output : "");
     if(output) free(output);
     
     safe_log("(%d) ended (-1)\n", job->client_id);
@@ -132,6 +167,7 @@ void run_shell_job(Job *job) {
 void run_demo_job(Job *job) {
     int quantum = (job->rounds_run == 0) ? SCHED_QUANTUM_1 : SCHED_QUANTUM_REST; 
     int time_slice = 0;
+    int was_preempted = 0;
 
     safe_log("(%d) started (%d)\n", job->client_id, job->remaining_time);
     if(job->rounds_run > 0) {
@@ -144,27 +180,42 @@ void run_demo_job(Job *job) {
         int current_progress = job->initial_burst - job->remaining_time + 1;
         char buf[64];
         snprintf(buf, sizeof(buf), "Demo %d/%d", current_progress, job->initial_burst);
-        send_line(job->client_fd, buf);
+        safe_send_line(job->client_fd, buf);
 
         job->remaining_time--;
         time_slice++;
 
-        // Preemption Check 
+        // Preemption Check - FIXED: Keep mutex locked during entire check
+        // This prevents race conditions where queue state changes between selection and decision
         pthread_mutex_lock(&queue_mutex);
-        Job *potential_better = select_job(0);
-        pthread_mutex_unlock(&queue_mutex);
-
-        if (potential_better && potential_better != job) {
-            if (potential_better->initial_burst == -1 || 
-                potential_better->remaining_time < job->remaining_time) {
+        
+        // FIXED: Exclude current job from selection to avoid comparing against itself
+        Job *potential_better = select_job(0, job);
+        
+        // FIXED: Only preempt if there's a different job with strictly better priority
+        // Shell commands always preempt, or shorter remaining time for demo jobs
+        if (potential_better) {
+            if (potential_better->initial_burst == -1) {
+                // Shell command always preempts demo jobs
+                was_preempted = 1;
+                pthread_mutex_unlock(&queue_mutex);
+                break; // Preempt
+            } else if (potential_better->remaining_time < job->remaining_time) {
+                // Shorter remaining time preempts
+                was_preempted = 1;
+                pthread_mutex_unlock(&queue_mutex);
                 break; // Preempt
             }
         }
+        
+        pthread_mutex_unlock(&queue_mutex);
     }
 
     job->rounds_run++;
 
-    if (job->remaining_time == 0) {
+    if (was_preempted) {
+        safe_log("(%d) preempted (%d)\n", job->client_id, job->remaining_time);
+    } else if (job->remaining_time == 0) {
         safe_log("(%d) ended (0)\n", job->client_id);
     } else {
         safe_log("(%d) waiting (%d)\n", job->client_id, job->remaining_time);
@@ -182,14 +233,16 @@ void *scheduler_loop(void *arg) {
         pthread_mutex_unlock(&queue_mutex);
 
         pthread_mutex_lock(&queue_mutex);
-        Job *job = select_job(1); 
+        Job *job = select_job(1, NULL);  // FIXED: Pass NULL to exclude nothing when selecting
+        // FIXED: Track currently running job for preemption checks
+        current_running_job = job;
         pthread_mutex_unlock(&queue_mutex);
 
         if (!job) continue;
 
         if (job->type == JOB_CMD) {
             run_shell_job(job);
-            send_line(job->client_fd, "<<EOF>>"); 
+            safe_send_line(job->client_fd, "<<EOF>>"); 
             free(job->command);
             free(job);
         } else {
@@ -201,11 +254,16 @@ void *scheduler_loop(void *arg) {
                 job_queue_head = job;
                 pthread_mutex_unlock(&queue_mutex);
             } else {
-                send_line(job->client_fd, "<<EOF>>");
+                safe_send_line(job->client_fd, "<<EOF>>");
                 free(job->command);
                 free(job);
             }
         }
+        
+        // FIXED: Clear running job after execution completes (whether finished or preempted)
+        pthread_mutex_lock(&queue_mutex);
+        current_running_job = NULL;
+        pthread_mutex_unlock(&queue_mutex);
     }
     return NULL;
 }
@@ -291,6 +349,9 @@ int main(int argc, char *argv[]) {
         pthread_create(&tid, NULL, handle_client_input, c);
         pthread_detach(tid);
     }
+    
+    // FIXED: Wait for scheduler thread to exit cleanly
+    pthread_join(sched_tid, NULL);
     
     return 0;
 }
