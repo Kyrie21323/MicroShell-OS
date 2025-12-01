@@ -1,6 +1,5 @@
 #ifndef ERRORS_H
 #define ERRORS_H
-
 #define ERR_CMD_NOT_FOUND "Command not found.\n"
 #define ERR_FILE_NOT_FOUND "File not found.\n"
 #define ERR_INPUT_NOT_SPECIFIED "Input file not specified.\n"
@@ -13,7 +12,4 @@
 #define ERR_CMD_MISSING_BEFORE_PIPE "Command missing before pipe.\n"
 #define ERR_EMPTY_CMD_BETWEEN_PIPES "Empty command between pipes.\n"
 #define ERR_UNCLOSED_QUOTES "Unclosed quotes.\n"
-#define ERR_CMD_NOT_FOUND_IN_PIPE "Command not found in pipe sequence.\n"
-
 #endif
-
