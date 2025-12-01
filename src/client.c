@@ -5,80 +5,54 @@
 #include <signal.h>
 
 #define MAX_CMD_LENGTH 1024 
-#define MAX_RESPONSE_LENGTH 65536 // 64KB buffer for server response
+#define MAX_RESPONSE_LENGTH 65536
 
 static int client_fd = -1;
 
 void signal_handler(int sig){
-    (void)sig; // Unused parameter
+    (void)sig; 
     printf("\n[INFO] Shutting down client...\n");
-    if(client_fd >= 0){
-        close_socket(client_fd);
-    }
+    if(client_fd >= 0) close_socket(client_fd);
     exit(0);
 }
 
 int main(int argc, char *argv[]){
-    // Use default server IP and port (no command-line arguments required)
     char *server_ip = "127.0.0.1";
     int port = 8080;
     char cmd_buffer[MAX_CMD_LENGTH];
     char response_buffer[MAX_RESPONSE_LENGTH];
-    (void)argc;  // Suppress unused parameter warning
-    (void)argv;  // Suppress unused parameter warning
+    (void)argc; (void)argv;
 
     signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
 
     client_fd = create_client_socket(server_ip, port);
     if(client_fd < 0){
-        fprintf(stderr, "Error: Failed to connect to server\n");
+        fprintf(stderr, "Error: Failed to connect\n");
         exit(1);
     }
-
-    // This message is now printed by create_client_socket
-    // printf("[INFO] Connected to server successfully\n");
 
     while(1){
         printf("$ ");
         fflush(stdout);
 
-        if(fgets(cmd_buffer, sizeof(cmd_buffer), stdin) == NULL){
-            printf("\n[INFO] End of input, sending exit command...\n");
-            strcpy(cmd_buffer, "exit"); // Send exit command on Ctrl+D
-        }
-
+        if(fgets(cmd_buffer, sizeof(cmd_buffer), stdin) == NULL) break;
         cmd_buffer[strcspn(cmd_buffer, "\n")] = '\0';
+        if(strlen(cmd_buffer) == 0) continue;
 
-        if (strlen(cmd_buffer) == 0 && feof(stdin)) {
-            // Handle case where Ctrl+D was on an empty line
-            break; 
-        }
-
-        if(strlen(cmd_buffer) == 0){
-            continue;
-        }
-
-        if(send_line(client_fd, cmd_buffer) < 0){
-            perror("Error sending command. Server may have disconnected");
-            break;
-        }
-
-        if(strcmp(cmd_buffer, "exit") == 0){
-            // Changed this message to match the project screenshot 
-            printf("Disconnected from server.\n");
-            break;
-        }
+        if(send_line(client_fd, cmd_buffer) < 0) break;
+        if(strcmp(cmd_buffer, "exit") == 0) break;
         
-        // Wait for and receive the server's response
-        int bytes_received = receive_line(client_fd, response_buffer, sizeof(response_buffer));
-        if (bytes_received < 0) {
-            perror("Error receiving response from server");
-            break;
-        } else {
-            // Print the response from the server
-            printf("%s", response_buffer);
-            fflush(stdout);
+        // Loop to receive multi-line output until server says "CMD_DONE"
+        while(1) {
+            int bytes = receive_line(client_fd, response_buffer, sizeof(response_buffer));
+            if(bytes <= 0) break; // Error or disconnect
+            
+            // Check for our custom End-Of-Transmission marker
+            if(strcmp(response_buffer, "<<EOF>>") == 0) {
+                break;
+            }
+            
+            printf("%s\n", response_buffer); // Print output line
         }
     }
 
