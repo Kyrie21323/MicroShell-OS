@@ -26,8 +26,20 @@ static int job_id_counter = 0;
 // Scheduler Queue
 Job *job_queue_head = NULL;
 Job *current_running_job = NULL;  // Track currently running job for preemption checks
+int last_job_id = -1;  // Track last job ID to enforce "no same job twice consecutively" rule
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+// Timeline tracking for final summary
+typedef struct TimelineEntry {
+    int client_id;
+    int elapsed_time;  // Changed from remaining_time to elapsed_time for global time tracking
+    struct TimelineEntry *next;
+} TimelineEntry;
+static TimelineEntry *timeline_head = NULL;
+static TimelineEntry *timeline_tail = NULL;
+static int had_preemption = 0;  // Track if any preemption occurred (only print summary if true)
+static int global_time = 0;  // Track global elapsed time for timeline summary
 
 // Logs
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -71,51 +83,68 @@ void add_job(Job *new_job) {
     pthread_mutex_unlock(&queue_mutex);
 }
 
-// SRJF Selection Algorithm [cite: 13, 48]
+// SRJF Selection Algorithm with "no same job twice consecutively" rule
 // If exclude is non-NULL, excludes that job from selection (for preemption checks)
-Job *select_job(int remove, Job *exclude) {
+// If last_job_id >= 0, avoids selecting that job ID unless it's the only option
+Job *select_job(int remove, Job *exclude, int last_job_id) {
     if (!job_queue_head) return NULL;
 
-    Job *best = NULL;
-    Job *best_prev = NULL;
-
+    // First pass: Find shortest remaining time among non-excluded demo jobs
+    int shortest_time = -1;
     Job *curr = job_queue_head;
-    Job *curr_prev = NULL;
-
-    // Find first non-excluded job as initial best
-    while (curr && !best) {
-        if (curr != exclude) {
-            best = curr;
-            best_prev = curr_prev;
+    while (curr) {
+        if (curr != exclude && curr->initial_burst != -1) {
+            if (shortest_time == -1 || curr->remaining_time < shortest_time) {
+                shortest_time = curr->remaining_time;
+            }
         }
-        curr_prev = curr;
         curr = curr->next;
     }
-
-    if (!best) return NULL;  // All jobs are excluded or queue empty
-
-    // Continue from where we left off
-    curr = best->next;
-    curr_prev = best;
-
+    
+    // Second pass: Select best job according to priority rules
+    curr = job_queue_head;
+    Job *curr_prev = NULL;
+    Job *best = NULL;
+    Job *best_prev = NULL;
+    Job *alternate_best = NULL;  // Alternative if best matches last_job_id
+    Job *alternate_best_prev = NULL;
+    
     while (curr) {
-        // Skip excluded job
         if (curr == exclude) {
             curr_prev = curr;
             curr = curr->next;
             continue;
         }
-
-        // Priority 1: Shell Commands (burst == -1) [cite: 50]
+        
+        // Priority 1: Shell Commands (burst == -1) always selected first
         if (curr->initial_burst == -1) {
-            if (best->initial_burst != -1) {
+            if (!best || best->initial_burst != -1) {
                 best = curr;
                 best_prev = curr_prev;
             }
         }
-        // Priority 2: Shortest Remaining Job (if neither is shell)
-        else if (best->initial_burst != -1) {
-            if (curr->remaining_time < best->remaining_time) {
+        // Priority 2: Jobs with shortest remaining time (SJRF)
+        else if (shortest_time >= 0 && curr->remaining_time == shortest_time) {
+            // Check if this is a candidate for selection
+            if (!best || best->initial_burst == -1 || 
+                (best->initial_burst != -1 && best->remaining_time > shortest_time)) {
+                // This job is better than current best
+                if (last_job_id >= 0 && curr->id == last_job_id) {
+                    // This matches last job - save as alternate, but look for different one
+                    if (!alternate_best) {
+                        alternate_best = curr;
+                        alternate_best_prev = curr_prev;
+                    }
+                } else {
+                    // This is different from last job - prefer it
+                    best = curr;
+                    best_prev = curr_prev;
+                }
+            } else if (best && best->initial_burst != -1 && 
+                       best->remaining_time == shortest_time &&
+                       last_job_id >= 0 && best->id == last_job_id &&
+                       curr->id != last_job_id) {
+                // Current best matches last_job_id, but this one doesn't - prefer this
                 best = curr;
                 best_prev = curr_prev;
             }
@@ -124,6 +153,68 @@ Job *select_job(int remove, Job *exclude) {
         curr_prev = curr;
         curr = curr->next;
     }
+    
+    // If best matches last_job_id, check if we have alternate options
+    if (best && last_job_id >= 0 && best->id == last_job_id) {
+        // Check if there are other jobs with same shortest time
+        curr = job_queue_head;
+        int other_options = 0;
+        while (curr) {
+            if (curr != exclude && curr != best &&
+                curr->initial_burst != -1 && 
+                curr->remaining_time == shortest_time &&
+                curr->id != last_job_id) {
+                other_options = 1;
+                break;
+            }
+            curr = curr->next;
+        }
+        
+        // If other options exist, we should have found them above
+        // But if we only have alternate_best, use it only if no other options
+        if (!other_options && alternate_best && alternate_best->id == last_job_id) {
+            // Only option is the same job - must select it (rule exception)
+            best = alternate_best;
+            best_prev = alternate_best_prev;
+        } else if (other_options) {
+            // There are other options - we should have selected one above
+            // This shouldn't happen, but if it does, keep current best
+        }
+    }
+
+    // Fallback: If best is still NULL, we need to pick ANY runnable job
+    // This prevents returning NULL when jobs exist in the queue
+    if (!best) {
+        // Try to find any job that doesn't match last_job_id
+        curr = job_queue_head;
+        curr_prev = NULL;
+        while (curr) {
+            if (curr != exclude && (last_job_id < 0 || curr->id != last_job_id)) {
+                best = curr;
+                best_prev = curr_prev;
+                break;
+            }
+            curr_prev = curr;
+            curr = curr->next;
+        }
+        
+        // If still NULL, just pick the first non-excluded job (even if it matches last_job_id)
+        if (!best) {
+            curr = job_queue_head;
+            curr_prev = NULL;
+            while (curr) {
+                if (curr != exclude) {
+                    best = curr;
+                    best_prev = curr_prev;
+                    break;
+                }
+                curr_prev = curr;
+                curr = curr->next;
+            }
+        }
+    }
+
+    if (!best) return NULL;  // No valid job found (should never happen if queue has jobs)
 
     if (remove && best) {
         if (best_prev) {
@@ -167,15 +258,17 @@ void run_shell_job(Job *job) {
 void run_demo_job(Job *job) {
     int quantum = (job->rounds_run == 0) ? SCHED_QUANTUM_1 : SCHED_QUANTUM_REST; 
     int time_slice = 0;
-    int was_preempted = 0;
+    int was_preempted_by_shell = 0;  // Only track shell preemption now
 
-    safe_log("(%d) started (%d)\n", job->client_id, job->remaining_time);
-    if(job->rounds_run > 0) {
-         safe_log("(%d) running (%d)\n", job->client_id, job->remaining_time);
+    // Logging: first run prints "started", subsequent runs print "running"
+    if (job->rounds_run == 0) {
+        safe_log("(%d) started (%d)\n", job->client_id, job->remaining_time);
+    } else {
+        safe_log("(%d) running (%d)\n", job->client_id, job->remaining_time);
     }
 
     while (time_slice < quantum && job->remaining_time > 0) {
-        sleep(1); // Simulate work [cite: 17]
+        sleep(1); // Simulate work
         
         int current_progress = job->initial_burst - job->remaining_time + 1;
         char buf[64];
@@ -185,27 +278,19 @@ void run_demo_job(Job *job) {
         job->remaining_time--;
         time_slice++;
 
-        // Preemption Check - FIXED: Keep mutex locked during entire check
-        // This prevents race conditions where queue state changes between selection and decision
+        // Preemption Check: Only shell commands preempt demo jobs mid-quantum
+        // Demo jobs do NOT preempt each other mid-quantum (removed remaining_time comparison)
         pthread_mutex_lock(&queue_mutex);
         
-        // FIXED: Exclude current job from selection to avoid comparing against itself
-        Job *potential_better = select_job(0, job);
+        Job *potential_better = select_job(0, job, last_job_id);
         
-        // FIXED: Only preempt if there's a different job with strictly better priority
-        // Shell commands always preempt, or shorter remaining time for demo jobs
-        if (potential_better) {
-            if (potential_better->initial_burst == -1) {
-                // Shell command always preempts demo jobs
-                was_preempted = 1;
-                pthread_mutex_unlock(&queue_mutex);
-                break; // Preempt
-            } else if (potential_better->remaining_time < job->remaining_time) {
-                // Shorter remaining time preempts
-                was_preempted = 1;
-                pthread_mutex_unlock(&queue_mutex);
-                break; // Preempt
-            }
+        // Only shell commands can preempt demo jobs
+        if (potential_better && potential_better->initial_burst == -1) {
+            // Shell command always preempts demo jobs
+            was_preempted_by_shell = 1;
+            had_preemption = 1;  // Mark that preemption occurred
+            pthread_mutex_unlock(&queue_mutex);
+            break; // Preempt
         }
         
         pthread_mutex_unlock(&queue_mutex);
@@ -213,13 +298,58 @@ void run_demo_job(Job *job) {
 
     job->rounds_run++;
 
-    if (was_preempted) {
+    // Logging: use "preempted" only for shell preemption, "waiting" for quantum end
+    if (was_preempted_by_shell) {
         safe_log("(%d) preempted (%d)\n", job->client_id, job->remaining_time);
     } else if (job->remaining_time == 0) {
-        safe_log("(%d) ended (0)\n", job->client_id);
+        safe_log("(%d) ended (0)\n", job->client_id, job->remaining_time);
     } else {
         safe_log("(%d) waiting (%d)\n", job->client_id, job->remaining_time);
     }
+}
+
+// Add entry to timeline for final summary
+static void add_timeline_entry(int client_id, int elapsed_time) {
+    TimelineEntry *entry = malloc(sizeof(TimelineEntry));
+    if (!entry) return;
+    entry->client_id = client_id;
+    entry->elapsed_time = elapsed_time;
+    entry->next = NULL;
+    
+    if (!timeline_head) {
+        timeline_head = timeline_tail = entry;
+    } else {
+        timeline_tail->next = entry;
+        timeline_tail = entry;
+    }
+}
+
+// Clear timeline entries without printing (for non-preemptive scenarios)
+static void clear_timeline(void) {
+    TimelineEntry *curr = timeline_head;
+    while (curr) {
+        TimelineEntry *next = curr->next;
+        free(curr);
+        curr = next;
+    }
+    timeline_head = timeline_tail = NULL;
+}
+
+// Print final timeline summary when queue becomes empty
+static void print_timeline_summary(void) {
+    if (!timeline_head) return;
+    
+    TimelineEntry *curr = timeline_head;
+    printf("\n");
+    while (curr) {
+        printf("P%d-(%d)", curr->client_id, curr->elapsed_time);
+        if (curr->next) printf("-");
+        curr = curr->next;
+    }
+    printf("\n");
+    
+    // Free timeline entries
+    clear_timeline();
 }
 
 void *scheduler_loop(void *arg) {
@@ -227,15 +357,31 @@ void *scheduler_loop(void *arg) {
     while (!g_stop) {
         pthread_mutex_lock(&queue_mutex);
         while (job_queue_head == NULL && !g_stop) {
+            // When queue becomes empty, print timeline summary if we have any timeline data
+            if (timeline_head != NULL) {
+                print_timeline_summary();
+            }
             pthread_cond_wait(&queue_cond, &queue_mutex);
         }
-        if (g_stop) { pthread_mutex_unlock(&queue_mutex); break; }
+        if (g_stop) { 
+            // On shutdown, print timeline summary if we have any timeline data
+            if (timeline_head != NULL) {
+                print_timeline_summary();
+            }
+            pthread_mutex_unlock(&queue_mutex); 
+            break; 
+        }
         pthread_mutex_unlock(&queue_mutex);
 
         pthread_mutex_lock(&queue_mutex);
-        Job *job = select_job(1, NULL);  // FIXED: Pass NULL to exclude nothing when selecting
+        // FIXED: Pass last_job_id to enforce "no same job twice consecutively" rule
+        Job *job = select_job(1, NULL, last_job_id);
         // FIXED: Track currently running job for preemption checks
         current_running_job = job;
+        if (job) {
+            // FIXED: Update last_job_id to track which job just ran
+            last_job_id = job->id;
+        }
         pthread_mutex_unlock(&queue_mutex);
 
         if (!job) continue;
@@ -243,10 +389,22 @@ void *scheduler_loop(void *arg) {
         if (job->type == JOB_CMD) {
             run_shell_job(job);
             safe_send_line(job->client_fd, "<<EOF>>"); 
+            // Shell jobs execute instantly for timeline purposes (assume negligible time)
+            // We don't increment global_time for shell commands in this model
+            // But we still add a timeline entry if needed
             free(job->command);
             free(job);
         } else {
+            int remaining_before = job->remaining_time;
             run_demo_job(job);
+            int remaining_after = job->remaining_time;
+            
+            // Calculate time spent in this quantum and update global time
+            int time_spent = remaining_before - remaining_after;
+            global_time += time_spent;
+            
+            // Record timeline entry with global elapsed time
+            add_timeline_entry(job->client_id, global_time);
             
             if (job->remaining_time > 0) {
                 pthread_mutex_lock(&queue_mutex);
