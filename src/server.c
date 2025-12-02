@@ -245,13 +245,18 @@ void run_shell_job(Job *job) {
     
     char *output = execute_pipeline(job->command, job->client_fd);
     
+    // Track bytes sent for shell output
     if(output && strlen(output) > 0) {
-        safe_log("[%d]<<< %lu bytes sent\n", job->client_id, strlen(output));
+        job->bytes_sent += strlen(output);
     }
     
     safe_send_line(job->client_fd, output ? output : "");
     if(output) free(output);
     
+    // Log bytes summary before ended
+    if(job->bytes_sent > 0) {
+        safe_log("[%d]<<< %d bytes sent\n", job->client_id, job->bytes_sent);
+    }
     safe_log("(%d) ended (-1)\n", job->client_id);
 }
 
@@ -274,6 +279,9 @@ void run_demo_job(Job *job) {
         char buf[64];
         snprintf(buf, sizeof(buf), "Demo %d/%d", current_progress, job->initial_burst);
         safe_send_line(job->client_fd, buf);
+        
+        // Track bytes sent (each Demo line)
+        job->bytes_sent += strlen(buf);
 
         job->remaining_time--;
         time_slice++;
@@ -299,13 +307,13 @@ void run_demo_job(Job *job) {
     job->rounds_run++;
 
     // Logging: use "preempted" only for shell preemption, "waiting" for quantum end
+    // Note: "ended" logging moved to scheduler_loop to print after bytes summary
     if (was_preempted_by_shell) {
         safe_log("(%d) preempted (%d)\n", job->client_id, job->remaining_time);
-    } else if (job->remaining_time == 0) {
-        safe_log("(%d) ended (0)\n", job->client_id, job->remaining_time);
-    } else {
+    } else if (job->remaining_time > 0) {
         safe_log("(%d) waiting (%d)\n", job->client_id, job->remaining_time);
     }
+    // If remaining_time == 0, we don't log here; scheduler_loop will log bytes + ended
 }
 
 // Add entry to timeline for final summary
@@ -412,6 +420,12 @@ void *scheduler_loop(void *arg) {
                 job_queue_head = job;
                 pthread_mutex_unlock(&queue_mutex);
             } else {
+                // Job completed - log bytes summary and ended
+                if (job->bytes_sent > 0) {
+                    safe_log("[%d]<<< %d bytes sent\n", job->client_id, job->bytes_sent);
+                }
+                safe_log("(%d) ended (0)\n", job->client_id, job->remaining_time);
+                
                 safe_send_line(job->client_fd, "<<EOF>>");
                 free(job->command);
                 free(job);
@@ -450,6 +464,7 @@ void *handle_client_input(void *arg) {
         job->client_fd = client_fd;
         job->command = xstrdup(buffer);
         job->rounds_run = 0;
+        job->bytes_sent = 0;  // Initialize bytes counter
         job->next = NULL;
 
         // Parse demo command

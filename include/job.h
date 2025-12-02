@@ -15,6 +15,7 @@ typedef struct Job {
     int initial_burst;      // N (or -1)
     int remaining_time;     // Decrements as it runs
     int rounds_run;         // To track Quantum (3s vs 7s)
+    int bytes_sent;         // Track total bytes sent to client for this job
     struct Job *next;       // For Linked List
 } Job;
 
