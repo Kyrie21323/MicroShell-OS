@@ -22,6 +22,7 @@ static int server_fd = -1;
 static volatile sig_atomic_t g_stop = 0;
 static int client_id_counter = 0;
 static int job_id_counter = 0;
+static int g_job_arrival_counter = 0;  // Track arrival sequence for preemption logic
 
 // Scheduler Queue
 Job *job_queue_head = NULL;
@@ -77,7 +78,7 @@ void add_job(Job *new_job) {
         curr->next = new_job;
     }
     
-    safe_log("(%d) created (%d)\n", new_job->client_id, new_job->initial_burst);
+    safe_log("(%d) --- created (%d)\n", new_job->client_id, new_job->initial_burst);
     
     pthread_cond_signal(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
@@ -241,7 +242,7 @@ static int safe_send_line(int client_fd, const char *line) {
 }
 
 void run_shell_job(Job *job) {
-    safe_log("(%d) started (-1)\n", job->client_id);
+    safe_log("(%d) --- started (-1)\n", job->client_id);
     
     char *output = execute_pipeline(job->command, job->client_fd);
     
@@ -255,27 +256,27 @@ void run_shell_job(Job *job) {
     
     // Log bytes summary before ended
     if(job->bytes_sent > 0) {
-        safe_log("[%d]<<< %d bytes sent\n", job->client_id, job->bytes_sent);
+        safe_log("[%d] <<< %d bytes sent\n", job->client_id, job->bytes_sent);
     }
-    safe_log("(%d) ended (-1)\n", job->client_id);
+    safe_log("(%d) --- ended (-1)\n", job->client_id);
 }
 
 void run_demo_job(Job *job) {
     int quantum = (job->rounds_run == 0) ? SCHED_QUANTUM_1 : SCHED_QUANTUM_REST; 
     int time_slice = 0;
-    int was_preempted_by_shell = 0;  // Only track shell preemption now
+    int was_preempted = 0;  // Track if this job was preempted
 
     // Logging: first run prints "started", subsequent runs print "running"
     if (job->rounds_run == 0) {
-        safe_log("(%d) started (%d)\n", job->client_id, job->remaining_time);
+        safe_log("(%d) --- started (%d)\n", job->client_id, job->remaining_time);
     } else {
-        safe_log("(%d) running (%d)\n", job->client_id, job->remaining_time);
+        safe_log("(%d) --- running (%d)\n", job->client_id, job->remaining_time);
     }
 
     while (time_slice < quantum && job->remaining_time > 0) {
         sleep(1); // Simulate work
         
-        int current_progress = job->initial_burst - job->remaining_time + 1;
+        int current_progress = job->initial_burst - job->remaining_time;
         char buf[64];
         snprintf(buf, sizeof(buf), "Demo %d/%d", current_progress, job->initial_burst);
         safe_send_line(job->client_fd, buf);
@@ -286,17 +287,40 @@ void run_demo_job(Job *job) {
         job->remaining_time--;
         time_slice++;
 
-        // Preemption Check: Only shell commands preempt demo jobs mid-quantum
-        // Demo jobs do NOT preempt each other mid-quantum (removed remaining_time comparison)
+        // Preemption Check: Shell commands and newer shorter demo jobs can preempt
         pthread_mutex_lock(&queue_mutex);
         
+        // Check for shell commands first (always preempt)
         Job *potential_better = select_job(0, job, last_job_id);
         
-        // Only shell commands can preempt demo jobs
         if (potential_better && potential_better->initial_burst == -1) {
             // Shell command always preempts demo jobs
-            was_preempted_by_shell = 1;
+            was_preempted = 1;
             had_preemption = 1;  // Mark that preemption occurred
+            pthread_mutex_unlock(&queue_mutex);
+            break; // Preempt
+        }
+        
+        // Check for newer demo jobs with strictly shorter INITIAL burst time
+        // "Newer" means arrived after this job started its current run (arrival_seq > run_epoch_seq)
+        // Only check if we haven't already started running (time_slice == 0 would be start of quantum)
+        Job *curr = job_queue_head;
+        int found_newer_shorter = 0;
+        while (curr) {
+            if (curr != job && 
+                curr->initial_burst != -1 &&  // Is a demo job
+                curr->arrival_seq > job->run_epoch_seq &&  // Arrived after this run started
+                curr->initial_burst < job->initial_burst) {  // Strictly shorter INITIAL burst
+                found_newer_shorter = 1;
+                break;
+            }
+            curr = curr->next;
+        }
+        
+        if (found_newer_shorter) {
+            // Newer shorter job arrived - preempt current job
+            was_preempted = 1;
+            had_preemption = 1;
             pthread_mutex_unlock(&queue_mutex);
             break; // Preempt
         }
@@ -306,12 +330,10 @@ void run_demo_job(Job *job) {
 
     job->rounds_run++;
 
-    // Logging: use "preempted" only for shell preemption, "waiting" for quantum end
-    // Note: "ended" logging moved to scheduler_loop to print after bytes summary
-    if (was_preempted_by_shell) {
-        safe_log("(%d) preempted (%d)\n", job->client_id, job->remaining_time);
-    } else if (job->remaining_time > 0) {
-        safe_log("(%d) waiting (%d)\n", job->client_id, job->remaining_time);
+    // Logging: For demo jobs, always use "waiting" when there's remaining time
+    // Never log "preempted" for demo jobs - preemption is implied by waiting before quantum ends
+    if (job->remaining_time > 0) {
+        safe_log("(%d) --- waiting (%d)\n", job->client_id, job->remaining_time);
     }
     // If remaining_time == 0, we don't log here; scheduler_loop will log bytes + ended
 }
@@ -348,7 +370,7 @@ static void print_timeline_summary(void) {
     if (!timeline_head) return;
     
     TimelineEntry *curr = timeline_head;
-    printf("\n");
+    printf("\n0)-");  // Always start with "0)-"
     while (curr) {
         printf("P%d-(%d)", curr->client_id, curr->elapsed_time);
         if (curr->next) printf("-");
@@ -394,6 +416,10 @@ void *scheduler_loop(void *arg) {
 
         if (!job) continue;
 
+        // Mark the arrival epoch when this job starts its current run
+        // Any job with arrival_seq > run_epoch_seq arrived "during" this run
+        job->run_epoch_seq = g_job_arrival_counter;
+
         if (job->type == JOB_CMD) {
             run_shell_job(job);
             safe_send_line(job->client_fd, "<<EOF>>"); 
@@ -422,9 +448,9 @@ void *scheduler_loop(void *arg) {
             } else {
                 // Job completed - log bytes summary and ended
                 if (job->bytes_sent > 0) {
-                    safe_log("[%d]<<< %d bytes sent\n", job->client_id, job->bytes_sent);
+                    safe_log("[%d] <<< %d bytes sent\n", job->client_id, job->bytes_sent);
                 }
-                safe_log("(%d) ended (0)\n", job->client_id, job->remaining_time);
+                safe_log("(%d) --- ended (%d)\n", job->client_id, job->remaining_time);
                 
                 safe_send_line(job->client_fd, "<<EOF>>");
                 free(job->command);
@@ -465,6 +491,8 @@ void *handle_client_input(void *arg) {
         job->command = xstrdup(buffer);
         job->rounds_run = 0;
         job->bytes_sent = 0;  // Initialize bytes counter
+        job->arrival_seq = ++g_job_arrival_counter;  // Track arrival order
+        job->run_epoch_seq = 0;  // Will be set when job starts running
         job->next = NULL;
 
         // Parse demo command

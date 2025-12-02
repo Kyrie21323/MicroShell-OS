@@ -16,6 +16,8 @@ typedef struct Job {
     int remaining_time;     // Decrements as it runs
     int rounds_run;         // To track Quantum (3s vs 7s)
     int bytes_sent;         // Track total bytes sent to client for this job
+    int arrival_seq;        // Incremented for each new job (tracks arrival order)
+    int run_epoch_seq;      // Marks the arrival counter when this job started its current run
     struct Job *next;       // For Linked List
 } Job;
 
