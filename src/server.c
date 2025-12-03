@@ -24,8 +24,10 @@ static int client_id_counter = 0;
 static int job_id_counter = 0;
 static int g_job_arrival_counter = 0;  // Track arrival sequence for preemption logic
 
-// Scheduler Queue
-Job *job_queue_head = NULL;
+// Scheduler Queues
+// Shell commands are handled separately with absolute priority (immediate execution)
+Job *shell_queue_head = NULL;  // FIFO queue for shell commands (run immediately)
+Job *job_queue_head = NULL;     // RR+SRJF queue for demo/program jobs only
 Job *current_running_job = NULL;  // Track currently running job for preemption checks
 int last_job_id = -1;  // Track last job ID to enforce "no same job twice consecutively" rule
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -67,9 +69,31 @@ void handle_sigint(int sig) {
 
 // --- Queue Helpers ---
 
+// Enqueue shell command to immediate-execution queue (absolute priority, FIFO)
+void add_shell_job(Job *new_job) {
+    pthread_mutex_lock(&queue_mutex);
+    
+    // Add to end of shell queue (FIFO order)
+    if (!shell_queue_head) {
+        shell_queue_head = new_job;
+    } else {
+        Job *curr = shell_queue_head;
+        while (curr->next) curr = curr->next;
+        curr->next = new_job;
+    }
+    
+    safe_log("(%d) --- created (%d)\n", new_job->client_id, new_job->initial_burst);
+    
+    // Wake scheduler immediately - shell commands have absolute priority
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+// Enqueue demo/program job to RR+SRJF scheduling queue
 void add_job(Job *new_job) {
     pthread_mutex_lock(&queue_mutex);
     
+    // Add to end of job queue
     if (!job_queue_head) {
         job_queue_head = new_job;
     } else {
@@ -273,6 +297,49 @@ void run_demo_job(Job *job) {
         safe_log("(%d) --- running (%d)\n", job->client_id, job->remaining_time);
     }
 
+    // Immediate preemption check: If a higher-priority job arrived between selection and execution,
+    // preempt this job before it does any work (enables 0-second preemption)
+    pthread_mutex_lock(&queue_mutex);
+    
+    // Check for shell commands (absolute priority)
+    if (shell_queue_head != NULL) {
+        was_preempted = 1;
+        had_preemption = 1;
+        pthread_mutex_unlock(&queue_mutex);
+        job->rounds_run++;
+        if (job->remaining_time > 0) {
+            safe_log("(%d) --- waiting (%d)\n", job->client_id, job->remaining_time);
+        }
+        return;  // Preempt immediately without doing any work
+    }
+    
+    // Check for newer demo jobs with strictly shorter remaining time
+    Job *curr = job_queue_head;
+    int found_newer_shorter = 0;
+    while (curr) {
+        if (curr != job && 
+            curr->initial_burst != -1 &&
+            curr->arrival_seq > job->run_epoch_seq &&
+            curr->remaining_time < job->remaining_time) {
+            found_newer_shorter = 1;
+            break;
+        }
+        curr = curr->next;
+    }
+    
+    if (found_newer_shorter) {
+        was_preempted = 1;
+        had_preemption = 1;
+        pthread_mutex_unlock(&queue_mutex);
+        job->rounds_run++;
+        if (job->remaining_time > 0) {
+            safe_log("(%d) --- waiting (%d)\n", job->client_id, job->remaining_time);
+        }
+        return;  // Preempt immediately without doing any work
+    }
+    
+    pthread_mutex_unlock(&queue_mutex);
+
     while (time_slice < quantum && job->remaining_time > 0) {
         sleep(1); // Simulate work
         
@@ -290,11 +357,9 @@ void run_demo_job(Job *job) {
         // Preemption Check: Shell commands and newer shorter demo jobs can preempt
         pthread_mutex_lock(&queue_mutex);
         
-        // Check for shell commands first (always preempt)
-        Job *potential_better = select_job(0, job, last_job_id);
-        
-        if (potential_better && potential_better->initial_burst == -1) {
-            // Shell command always preempts demo jobs
+        // Check for shell commands first (always preempt demo jobs)
+        if (shell_queue_head != NULL) {
+            // Shell command arrived - preempt current demo job immediately
             was_preempted = 1;
             had_preemption = 1;  // Mark that preemption occurred
             pthread_mutex_unlock(&queue_mutex);
@@ -378,16 +443,18 @@ static void print_timeline_summary(void) {
     }
     printf("\n");
     
-    // Free timeline entries
+    // Free timeline entries and reset global time for next scenario
     clear_timeline();
+    global_time = 0;  // Reset for next test scenario
 }
 
 void *scheduler_loop(void *arg) {
     (void)arg;
     while (!g_stop) {
         pthread_mutex_lock(&queue_mutex);
-        while (job_queue_head == NULL && !g_stop) {
-            // When queue becomes empty, print timeline summary if we have any timeline data
+        // Wait until there is work to do (either shell or demo/program jobs)
+        while (shell_queue_head == NULL && job_queue_head == NULL && !g_stop) {
+            // When both queues become empty, print timeline summary if we have any timeline data
             if (timeline_head != NULL) {
                 print_timeline_summary();
             }
@@ -401,16 +468,27 @@ void *scheduler_loop(void *arg) {
             pthread_mutex_unlock(&queue_mutex); 
             break; 
         }
-        pthread_mutex_unlock(&queue_mutex);
 
-        pthread_mutex_lock(&queue_mutex);
-        // FIXED: Pass last_job_id to enforce "no same job twice consecutively" rule
-        Job *job = select_job(1, NULL, last_job_id);
-        // FIXED: Track currently running job for preemption checks
-        current_running_job = job;
-        if (job) {
-            // FIXED: Update last_job_id to track which job just ran
-            last_job_id = job->id;
+        // Scheduling policy:
+        // 1) Shell commands always have absolute priority - run immediately to completion (FIFO)
+        // 2) Demo/program jobs scheduled using RR+SRJF only when no shell commands pending
+        Job *job = NULL;
+        
+        if (shell_queue_head != NULL) {
+            // Shell command available - take from front of shell queue (FIFO)
+            job = shell_queue_head;
+            shell_queue_head = shell_queue_head->next;
+            job->next = NULL;
+            // Shell jobs don't update last_job_id (they're outside RR rotation)
+        } else {
+            // No shell commands - select from demo/program queue using RR+SRJF
+            job = select_job(1, NULL, last_job_id);
+            // Track currently running job for preemption checks
+            current_running_job = job;
+            if (job) {
+                // Update last_job_id to track which job just ran (for fairness)
+                last_job_id = job->id;
+            }
         }
         pthread_mutex_unlock(&queue_mutex);
 
@@ -495,20 +573,22 @@ void *handle_client_input(void *arg) {
         job->run_epoch_seq = 0;  // Will be set when job starts running
         job->next = NULL;
 
-        // Parse demo command
+        // Parse command type and route to appropriate queue
         if (strncmp(buffer, "demo", 4) == 0 || strncmp(buffer, "./demo", 6) == 0 || strncmp(buffer, "/demo", 5) == 0) {
-             job->type = JOB_DEMO;
-             char *space = strchr(buffer, ' ');
-             if (space) job->initial_burst = atoi(space + 1);
-             else job->initial_burst = 5; 
-             job->remaining_time = job->initial_burst;
+            // Demo/program command: goes into RR+SRJF scheduling queue
+            job->type = JOB_DEMO;
+            char *space = strchr(buffer, ' ');
+            if (space) job->initial_burst = atoi(space + 1);
+            else job->initial_burst = 5; 
+            job->remaining_time = job->initial_burst;
+            add_job(job);  // Add to demo/program queue
         } else {
+            // Shell command: immediate execution path (not in RR queue)
             job->type = JOB_CMD;
             job->initial_burst = -1; 
             job->remaining_time = 0; 
+            add_shell_job(job);  // Add to immediate-priority shell queue
         }
-
-        add_job(job);
     }
     
     close_socket(client_fd);
