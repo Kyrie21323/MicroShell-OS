@@ -301,16 +301,16 @@ void run_demo_job(Job *job) {
             break; // Preempt
         }
         
-        // Check for newer demo jobs with strictly shorter INITIAL burst time
+        // Check for newer demo jobs with strictly shorter remaining burst time (SRJF preemption)
         // "Newer" means arrived after this job started its current run (arrival_seq > run_epoch_seq)
-        // Only check if we haven't already started running (time_slice == 0 would be start of quantum)
+        // This implements selectively preemptive SRJF based on remaining burst time
         Job *curr = job_queue_head;
         int found_newer_shorter = 0;
         while (curr) {
             if (curr != job && 
                 curr->initial_burst != -1 &&  // Is a demo job
                 curr->arrival_seq > job->run_epoch_seq &&  // Arrived after this run started
-                curr->initial_burst < job->initial_burst) {  // Strictly shorter INITIAL burst
+                curr->remaining_time < job->remaining_time) {  // Strictly shorter remaining burst (SRJF)
                 found_newer_shorter = 1;
                 break;
             }
